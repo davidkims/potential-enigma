@@ -1,0 +1,231 @@
+name: "🧱 Enigma Bulk Folder & Disk Expander (No-Heredoc, Safe)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_path:
+        description: "생성 기준 경로 (repo 내부)"
+        required: true
+        default: ".github/echo_enigma"
+      total_dirs:
+        description: "총 생성할 디렉토리 수"
+        required: true
+        default: "500"
+      depth:
+        description: "중첩 폴더 깊이 (1~5)"
+        required: true
+        default: "3"
+      fanout:
+        description: "각 레벨당 자식 폴더 개수(분기)"
+        required: true
+        default: "5"
+      files_per_dir:
+        description: "각 디렉토리에 넣을 파일 개수(.keep/README 등)"
+        required: true
+        default: "1"
+      do_disk_reclaim:
+        description: "러너 디스크 공간 확보 수행 (true/false)"
+        required: true
+        default: "true"
+      use_worktree_on_mnt:
+        description: "/mnt에 worktree 생성해 대용량 작업 (true/false)"
+        required: true
+        default: "true"
+      extra_disk_device:
+        description: "셀프호스트 러너 전용: 추가 디스크 장치 경로 (예: /dev/sdb)"
+        required: false
+        default: ""
+      commit_message:
+        description: "커밋 메시지"
+        required: true
+        default: "chore(enigma): bulk dir expansion + disk prep"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: enigma-expander-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  expand:
+    name: "Bulk Dir + Disk Prep"
+    runs-on: ubuntu-latest
+    env:
+      BASE_PATH: ${{ github.event.inputs.base_path }}
+      TOTAL_DIRS: ${{ github.event.inputs.total_dirs }}
+      DEPTH: ${{ github.event.inputs.depth }}
+      FANOUT: ${{ github.event.inputs.fanout }}
+      FILES_PER_DIR: ${{ github.event.inputs.files_per_dir }}
+      DO_DISK_RECLAIM: ${{ github.event.inputs.do_disk_reclaim }}
+      USE_WORKTREE: ${{ github.event.inputs.use_worktree_on_mnt }}
+      EXTRA_DISK_DEVICE: ${{ github.event.inputs.extra_disk_device }}
+      COMMIT_MSG: ${{ github.event.inputs.commit_message }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Show disk before
+        run: |
+          echo "[DISK][BEFORE]"; df -hT | sed 's/^/[DF] /' || true
+          echo "[MEM]"; free -h || true
+
+      - name: Reclaim disk space (GitHub-hosted)
+        if: ${{ env.DO_DISK_RECLAIM == 'true' }}
+        run: |
+          set -Eeuo pipefail
+          echo "[RECLAIM] Start"
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+          sudo docker system prune -af || true
+          sudo docker volume prune -f || true
+          sudo rm -rf /var/lib/docker || true
+          sudo apt-get clean || true
+          rm -rf ~/.cache || true
+          echo "[RECLAIM] Done"; df -h | sed 's/^/[DF1] /'
+
+      - name: Optional:mount extra disk (self-hosted only)
+        if: ${{ env.EXTRA_DISK_DEVICE != '' }}
+        run: |
+          set -Eeuo pipefail
+          DEV="${EXTRA_DISK_DEVICE}"
+          echo "[EXTRA] device: $DEV"
+          if [ -b "$DEV" ]; then
+            sudo parted -s "$DEV" mklabel gpt || true
+            sudo parted -s "$DEV" mkpart primary ext4 0% 100% || true
+            PART="$(lsblk -no PATH "$DEV" | tail -n1)1"
+            [ -b "$PART" ] || PART="${DEV}1"
+            sudo mkfs.ext4 -F "$PART"
+            sudo mkdir -p /mnt/enigma-extra
+            sudo mount "$PART" /mnt/enigma-extra
+            sudo chown -R "$USER:$USER" /mnt/enigma-extra
+            echo "[EXTRA] mounted at /mnt/enigma-extra"
+            df -h | sed 's/^/[DFX] /'
+          else
+            echo "[EXTRA][WARN] Not a block device: $DEV"
+          fi
+
+      - name: Use /mnt worktree for large ops (best-effort)
+        id: workdir
+        run: |
+          set -Eeuo pipefail
+          BR="${{ github.ref_name }}"
+          [ -n "$BR" ] || BR="$(git rev-parse --abbrev-ref HEAD)"
+          WORKDIR="$PWD"
+          if [ "${USE_WORKTREE}" = "true" ]; then
+            echo "[WT] Creating worktree on /mnt/enigma-work for branch: $BR"
+            sudo mkdir -p /mnt/enigma-work
+            sudo chown -R "$USER:$USER" /mnt/enigma-work
+            if git worktree add /mnt/enigma-work "$BR"; then
+              WORKDIR="/mnt/enigma-work"
+            else
+              echo "[WT][WARN] worktree failed, fallback to current workspace"
+            fi
+          fi
+          echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
+          echo "[WT] Workdir: $WORKDIR"
+
+      - name: Ensure dependencies (tree)
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y tree
+
+      - name: Generate enigma_expand.sh (no-heredoc)
+        run: |
+          set -Eeuo pipefail
+          mkdir -p scripts
+          {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf '%s\n' 'set -Eeuo pipefail'
+            printf '%s\n' 'BASE_PATH="${BASE_PATH:-.github/echo_enigma}"'
+            printf '%s\n' 'TOTAL_DIRS="${TOTAL_DIRS:-500}"'
+            printf '%s\n' 'DEPTH="${DEPTH:-3}"'
+            printf '%s\n' 'FANOUT="${FANOUT:-5}"'
+            printf '%s\n' 'FILES_PER_DIR="${FILES_PER_DIR:-1}"'
+            printf '%s\n' 'REPORT_DIR="${REPORT_DIR:-site/reports}"'
+            printf '%s\n' 'LOG_DIR="${LOG_DIR:-.github/echo_enigma/logs}"'
+            printf '%s\n' 'TS="$(date -u +%Y%m%dT%H%M%SZ)"'
+            printf '%s\n' 'echo "[ECHO] BASE_PATH=$BASE_PATH TOTAL_DIRS=$TOTAL_DIRS DEPTH=$DEPTH FANOUT=$FANOUT FILES_PER_DIR=$FILES_PER_DIR"'
+            printf '%s\n' 'mkdir -p "$BASE_PATH" "$REPORT_DIR" "$LOG_DIR"'
+            printf '%s\n' 'REPORT_CSV="$REPORT_DIR/dir_report_$TS.csv"'
+            printf '%s\n' 'TREE_LOG="$LOG_DIR/tree_$TS.log"'
+            printf '%s\n' 'echo "seq,rel_path,created_files" > "$REPORT_CSV"'
+            printf '%s\n' 'make_path_by_index () {'
+            printf '%s\n' '  local idx="$1" depth="$2" fanout="$3"; local path=""; local rem="$idx"'
+            printf '%s\n' '  for ((level=1; level<=depth; level++)); do'
+            printf '%s\n' '    local d=$(( rem % fanout )); rem=$(( rem / fanout ))'
+            printf '%s\n' '    path="${path}/l${level}_$(printf "%03d" "$d")"'
+            printf '%s\n' '  done'
+            printf '%s\n' '  printf "%s" "$path"'
+            printf '%s\n' '}'
+            printf '%s\n' 'created=0'
+            printf '%s\n' 'for ((i=0; i<TOTAL_DIRS; i++)); do'
+            printf '%s\n' '  rel="$(make_path_by_index "$i" "$DEPTH" "$FANOUT")/n$(printf "%05d" "$i")"'
+            printf '%s\n' '  dir="$BASE_PATH$rel"; mkdir -p "$dir"; cnt=0'
+            printf '%s\n' '  for ((f=1; f<=FILES_PER_DIR; f++)); do'
+            printf '%s\n' '    echo "# keep: $TS $i $f" > "$dir/.keep.$f"; cnt=$((cnt+1))'
+            printf '%s\n' '  done'
+            printf '%s\n' '  if [ ! -f "$dir/README.md" ]; then'
+            printf '%s\n' '    printf "%s\n" "# Enigma Node $(printf "%05d" "$i")" > "$dir/README.md"'
+            printf '%s\n' '    printf "%s\n" "- Timestamp: $TS" >> "$dir/README.md"'
+            printf '%s\n' '    printf "%s\n" "- Depth: $DEPTH / Fanout: $FANOUT" >> "$dir/README.md"'
+            printf '%s\n' '    printf "%s\n" "- Auto-generated" >> "$dir/README.md"'
+            printf '%s\n' '    cnt=$((cnt+1))'
+            printf '%s\n' '  fi'
+            printf '%s\n' '  echo "$i,$rel,$cnt" >> "$REPORT_CSV"'
+            printf '%s\n' '  created=$((created+1))'
+            printf '%s\n' 'done'
+            printf '%s\n' 'echo "[ECHO] Created dirs: $created"'
+            printf '%s\n' 'tree -a -L "$DEPTH" "$BASE_PATH" > "$TREE_LOG" || true'
+            printf '%s\n' 'echo "[OK] report: $REPORT_CSV"'
+            printf '%s\n' 'echo "[OK] tree:   $TREE_LOG"'
+          } > scripts/enigma_expand.sh
+          chmod +x scripts/enigma_expand.sh
+
+      - name: Run bulk creator
+        run: |
+          set -Eeuo pipefail
+          WORKDIR="${{ steps.workdir.outputs.workdir }}"
+          cd "$WORKDIR"
+          echo "[RUN] scripts/enigma_expand.sh"
+          BASE_PATH="$BASE_PATH" TOTAL_DIRS="$TOTAL_DIRS" DEPTH="$DEPTH" FANOUT="$FANOUT" FILES_PER_DIR="$FILES_PER_DIR" \
+            REPORT_DIR="site/reports" LOG_DIR=".github/echo_enigma/logs" ./scripts/enigma_expand.sh
+
+      - name: Git commit & push
+        run: |
+          set -Eeuo pipefail
+          WORKDIR="${{ steps.workdir.outputs.workdir }}"
+          cd "$WORKDIR"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "[GIT] No changes to commit."
+          else
+            echo "[GIT] Committing..."
+            git commit -m "$COMMIT_MSG"
+            echo "[GIT] Pushing..."
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      - name: Show disk after
+        if: always()
+        run: |
+          echo "[DISK][AFTER]"; df -hT | sed 's/^/[DF] /' || true
+          echo "[MEM]"; free -h || true
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enigma-reports
+          path: |
+            **/site/reports/*.csv
+            **/.github/echo_enigma/logs/*.log
+            scripts/enigma_expand.sh
+          if-no-files-found: ignore
