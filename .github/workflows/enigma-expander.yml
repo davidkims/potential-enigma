@@ -1,4 +1,4 @@
-name: "🧱 Enigma Bulk Folder & Disk Expander (No-Heredoc, Safe)"
+name: "🧱 Enigma Bulk Folder & Disk Expander (Worktree-Safe)"
 
 on:
   workflow_dispatch:
@@ -42,6 +42,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: enigma-expander-${{ github.ref_name }}
@@ -68,6 +69,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+      - name: Git safe.directory (컨테이너/루트 권한 대비)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+
       - name: Show disk before
         run: |
           echo "[DISK][BEFORE]"; df -hT | sed 's/^/[DF] /' || true
@@ -88,7 +93,7 @@ jobs:
           rm -rf ~/.cache || true
           echo "[RECLAIM] Done"; df -h | sed 's/^/[DF1] /'
 
-      - name: Optional:mount extra disk (self-hosted only)
+      - name: Optional: mount extra disk (self-hosted only)
         if: ${{ env.EXTRA_DISK_DEVICE != '' }}
         run: |
           set -Eeuo pipefail
@@ -109,25 +114,49 @@ jobs:
             echo "[EXTRA][WARN] Not a block device: $DEV"
           fi
 
-      - name: Use /mnt worktree for large ops (best-effort)
+      - name: Prepare worktree on /mnt (충돌 안전)
         id: workdir
         run: |
           set -Eeuo pipefail
           BR="${{ github.ref_name }}"
           [ -n "$BR" ] || BR="$(git rev-parse --abbrev-ref HEAD)"
-          WORKDIR="$PWD"
-          if [ "${USE_WORKTREE}" = "true" ]; then
-            echo "[WT] Creating worktree on /mnt/enigma-work for branch: $BR"
-            sudo mkdir -p /mnt/enigma-work
-            sudo chown -R "$USER:$USER" /mnt/enigma-work
-            if git worktree add /mnt/enigma-work "$BR"; then
-              WORKDIR="/mnt/enigma-work"
+          RUNID="${{ github.run_id }}-${{ github.run_attempt }}"
+          WTBR="wt-$RUNID"
+          WTDIR="/mnt/enigma-work"
+          WORKDIR="$GITHUB_WORKSPACE"
+          USE="${USE_WORKTREE}"
+
+          echo "base_branch=$BR" >> "$GITHUB_OUTPUT"
+
+          if [ "$USE" = "true" ]; then
+            echo "[WT] Requested worktree on $WTDIR for branch: $BR"
+            sudo mkdir -p "$WTDIR"
+            sudo chown -R "$USER:$USER" "$WTDIR"
+
+            # 브랜치 사용 여부 확인
+            IN_USE="$(git worktree list --porcelain | sed -n 's/^branch //p' | grep -cx "refs/heads/$BR" || true)"
+            if [ "$IN_USE" != "0" ]; then
+              echo "[WT] Branch '$BR' already used in another worktree; create temp branch: $WTBR"
+              # 원본 브랜치에서 임시 브랜치 강제 생성/갱신
+              git fetch --all --prune
+              git branch -f "$WTBR" "$BR"
+              # 임시 브랜치로 worktree 생성
+              git worktree add "$WTDIR" "$WTBR"
+              echo "worktree_branch=$WTBR" >> "$GITHUB_OUTPUT"
             else
-              echo "[WT][WARN] worktree failed, fallback to current workspace"
+              # 원 브랜치로 worktree 생성 가능
+              git worktree add "$WTDIR" "$BR"
+              echo "worktree_branch=$BR" >> "$GITHUB_OUTPUT"
             fi
+
+            WORKDIR="$WTDIR"
+          else
+            echo "[WT] Disabled; use current workspace"
+            echo "worktree_branch=$BR" >> "$GITHUB_OUTPUT"
           fi
+
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
-          echo "[WT] Workdir: $WORKDIR"
+          echo "[WT] Workdir: $WORKDIR (branch: $(cat $GITHUB_OUTPUT | sed -n 's/^worktree_branch=//p'))"
 
       - name: Ensure dependencies (tree)
         run: |
@@ -187,30 +216,99 @@ jobs:
           } > scripts/enigma_expand.sh
           chmod +x scripts/enigma_expand.sh
 
-      - name: Run bulk creator
+      - name: Run bulk creator (in workdir)
         run: |
           set -Eeuo pipefail
-          WORKDIR="${{ steps.workdir.outputs.workdir }}"
-          cd "$WORKDIR"
-          echo "[RUN] scripts/enigma_expand.sh"
+          WDIR="${{ steps.workdir.outputs.workdir }}"
+          cd "$WDIR"
+          echo "[RUN] $(pwd)/scripts/enigma_expand.sh"
           BASE_PATH="$BASE_PATH" TOTAL_DIRS="$TOTAL_DIRS" DEPTH="$DEPTH" FANOUT="$FANOUT" FILES_PER_DIR="$FILES_PER_DIR" \
             REPORT_DIR="site/reports" LOG_DIR=".github/echo_enigma/logs" ./scripts/enigma_expand.sh
 
-      - name: Git commit & push
+      - name: Commit in workdir
+        id: commit
         run: |
           set -Eeuo pipefail
-          WORKDIR="${{ steps.workdir.outputs.workdir }}"
-          cd "$WORKDIR"
+          WDIR="${{ steps.workdir.outputs.workdir }}"
+          WTBR="${{ steps.workdir.outputs.worktree_branch }}"
+          cd "$WDIR"
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
             echo "[GIT] No changes to commit."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "[GIT] Committing on $WTBR ..."
+          git commit -m "$COMMIT_MSG"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+          # 임시 브랜치면 동일 브랜치로 push, 아니면 현재 브랜치로 push
+          echo "[GIT] Pushing branch $WTBR ..."
+          git push origin "HEAD:$WTBR"
+
+      - name: Merge to base branch (FF → rebase → PR)
+        if: steps.commit.outputs.committed == 'true'
+        run: |
+          set -Eeuo pipefail
+          BASE="${{ steps.workdir.outputs.base_branch }}"
+          WTBR="${{ steps.workdir.outputs.worktree_branch }}"
+
+          echo "[MERGE] Base=$BASE, From=$WTBR"
+          cd "$GITHUB_WORKSPACE"
+          git fetch origin "$BASE" "$WTBR" --prune
+          git checkout "$BASE"
+          git pull --ff-only origin "$BASE" || true
+
+          # 1) FF merge 시도
+          if git merge --ff-only "origin/$WTBR"; then
+            echo "[MERGE] Fast-forward OK"
+            git push origin "$BASE"
           else
-            echo "[GIT] Committing..."
-            git commit -m "$COMMIT_MSG"
-            echo "[GIT] Pushing..."
-            git push origin HEAD:${{ github.ref_name }}
+            echo "[MERGE] FF failed, trying rebase ..."
+            git rebase "origin/$WTBR" || REBASE_FAIL=1
+            if [ "${REBASE_FAIL:-0}" = "1" ]; then
+              echo "[MERGE] Rebase failed, creating PR from $WTBR to $BASE"
+              NEWBR="enigma/${{ github.run_id }}-${{ github.run_attempt }}"
+              git checkout -b "$NEWBR" "origin/$WTBR"
+              git push -u origin "$NEWBR"
+              # gh 사용해 PR 생성 (있으면 스킵)
+              if command -v gh >/dev/null 2>&1; then
+                gh pr create --base "$BASE" --head "$NEWBR" \
+                  --title "Enigma bulk expansion (run ${{ github.run_id }})" \
+                  --body "Auto-generated bulk folder expansion. Please review and merge."
+              else
+                echo "[PR][WARN] gh CLI not found; pushed branch $NEWBR"
+              fi
+            else
+              echo "[MERGE] Rebase OK"
+              git push origin "$BASE"
+            fi
+          fi
+
+      - name: Cleanup worktree & temp branch
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          WTDIR="/mnt/enigma-work"
+          WTBR="${{ steps.workdir.outputs.worktree_branch }}"
+          BASE="${{ steps.workdir.outputs.base_branch }}"
+
+          # worktree 제거(있을 때만)
+          if [ -d "$WTDIR/.git" ] || [ -d "$WTDIR" ]; then
+            echo "[CLEAN] Removing worktree $WTDIR"
+            git worktree remove -f "$WTDIR" || true
+          fi
+
+          # 임시 브랜치 정리
+          if [ "$WTBR" != "$BASE" ]; then
+            echo "[CLEAN] Deleting temp branch $WTBR (local)"
+            git branch -D "$WTBR" || true
+            echo "[CLEAN] Deleting temp branch $WTBR (remote)"
+            git push origin --delete "$WTBR" || true
           fi
 
       - name: Show disk after
