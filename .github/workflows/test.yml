@@ -44,7 +44,6 @@ permissions:
   contents: write
 
 env:
-  # 공통 재시도 스크립트 본문
   RETRY_SCRIPT: |
     #!/usr/bin/env bash
     set -Eeuo pipefail
@@ -64,7 +63,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 마이그레이션 경고 제거용 고정 라벨
         os: [ubuntu-24.04, macos-15, windows-2022]
 
     steps:
@@ -76,7 +74,6 @@ jobs:
         run: |
           echo "$RETRY_SCRIPT" > .retry.sh && chmod +x .retry.sh
 
-      # ----- OS 업그레이드 -----
       - name: Upgrade base packages (Ubuntu)
         if: runner.os == 'Linux'
         shell: bash
@@ -158,7 +155,6 @@ jobs:
             C:\ProgramData\chocolatey\logs\chocolatey.log
           if-no-files-found: ignore
 
-      # ----- 실제 빌드 & 산출물 수집 -----
       - name: Run actual build script
         shell: bash
         run: |
@@ -188,7 +184,7 @@ jobs:
               if [ -f "$f" ]; then
                 mkdir -p "$(dirname "_matrix_release/$f")"
                 cp -f "$f" "_matrix_release/$f"; copied="yes"
-              elif [ -d "$f" ]; then
+              elif [ -d "$f" ] ; then
                 mkdir -p "_matrix_release/$f"
                 cp -rf "$f/." "_matrix_release/$f/"; copied="yes"
               fi
@@ -211,14 +207,16 @@ jobs:
     needs: [build_matrix]
     runs-on: ubuntu-24.04
     outputs:
-      should_release: ${{ steps.meta.outputs.should_release }}
-      tag:            ${{ steps.meta.outputs.tag }}
-      title:          ${{ steps.meta.outputs.title }}
-      prerelease:     ${{ steps.meta.outputs.prerelease }}
-      generate_notes: ${{ steps.meta.outputs.generate_notes }}
-      draft:          ${{ steps.meta.outputs.draft }}
-      notes_path:     ${{ steps.notes.outputs.notes_path }}
-      last_tag:       ${{ steps.lasttag.outputs.last_tag }}
+      should_release:        ${{ steps.meta.outputs.should_release }}
+      tag:                   ${{ steps.meta.outputs.tag }}
+      title:                 ${{ steps.meta.outputs.title }}
+      prerelease:            ${{ steps.meta.outputs.prerelease }}
+      generate_notes:        ${{ steps.meta.outputs.generate_notes }}
+      draft:                 ${{ steps.meta.outputs.draft }}
+      notes_path:            ${{ steps.notes.outputs.notes_path }}
+      last_tag:              ${{ steps.lasttag.outputs.last_tag }}
+      discussion_category:   ${{ steps.opts.outputs.discussion_category }}
+      pr_labels:             ${{ steps.opts.outputs.pr_labels }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -235,7 +233,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           O='${{ github.event.inputs.options_json }}'
-          # 기본값 병합
           DEF='{"prerelease":false,"generate_notes":true,"draft":false,"create_tag":true,"tag_prefix":"v","discussion_category":"Announcements","checksum":true,"sbom":true,"pr_labels":""}'
           MERGED="$(jq -c -n --argjson d "$DEF" --argjson u "$O" '$d * $u')"
           echo "json=$MERGED" >> "$GITHUB_OUTPUT"
@@ -303,7 +300,7 @@ jobs:
               NEXT="${prefix}${ver}"
             fi
           fi
-          echo "next=$NEXT"            >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT"             >> "$GITHUB_OUTPUT"
           echo "clean_changelog=$CLEAN" >> "$GITHUB_OUTPUT"
 
       - name: Decide release metadata (main-only & must-release)
@@ -344,12 +341,12 @@ jobs:
             SHOULD=true; TITLE="Release ${TAG}"
           fi
 
-          echo "should_release=$SHOULD"      >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG"                    >> "$GITHUB_OUTPUT"
-          echo "title=$TITLE"                >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE"      >> "$GITHUB_OUTPUT"
-          echo "generate_notes=$GEN_NOTES"   >> "$GITHUB_OUTPUT"
-          echo "draft=$DRAFT"                >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD"    >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"                  >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE"              >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE"    >> "$GITHUB_OUTPUT"
+          echo "generate_notes=$GEN_NOTES" >> "$GITHUB_OUTPUT"
+          echo "draft=$DRAFT"              >> "$GITHUB_OUTPUT"
 
       - name: Ensure tag exists for manual (create_tag)
         if: ${{ steps.meta.outputs.should_release == 'true' && contains(github.event_name, 'workflow_dispatch') && steps.opts.outputs.create_tag == 'true' }}
@@ -371,7 +368,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update && sudo apt-get install -y jq
           mkdir -p release
           TPL=".github/RELEASE_TEMPLATE.md"
           CHANGELOG='${{ steps.semvermap.outputs.clean_changelog }}'
@@ -432,13 +428,13 @@ jobs:
             (cd release && zip -r MINIMAL.zip .) || true
           fi
 
-      - name: Checksums
-        if: ${{ fromJSON(needs.prep_release.outputs.generate_notes) || true && fromJSON(steps.opts_json.outputs.checksum || 'true') != 'false' }}
+      - name: Checksums (always)
         shell: bash
         run: |
           set -Eeuo pipefail
           cd release
           find . -type f ! -name "SHA256SUMS.txt" -exec sha256sum "{}" \; | sort -k2 > SHA256SUMS.txt
+          echo "[CSUM] release/SHA256SUMS.txt created"
 
       - name: Import GPG key (optional)
         if: ${{ github.event.inputs.sign_with == 'gpg' }}
@@ -485,7 +481,7 @@ jobs:
           done
 
       - name: Generate SBOM (SPDX)
-        if: ${{ fromJSON(needs.prep_release.outputs.should_release) }}
+        if: ${{ needs.prep_release.outputs.should_release == 'true' }}
         uses: anchore/sbom-action@v0
         with:
           path: .
@@ -509,33 +505,31 @@ jobs:
           artifactErrorsFailBuild: false
 
       - name: Link Discussion (optional)
-        if: ${{ needs.prep_release.outputs.should_release == 'true' && needs.prep_release.outputs.tag != '' }}
+        if: ${{ needs.prep_release.outputs.should_release == 'true' && needs.prep_release.outputs.tag != '' && needs.prep_release.outputs.discussion_category != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CAT: ${{ needs.prep_release.outputs.should_release && 'Announcements' || 'Announcements' }}
         continue-on-error: true
         shell: bash
         run: |
           set -Eeuo pipefail
-          # GitHub Release Action이 discussionCategoryName 옵션 미지원/실패할 수 있어 gh로 후처리 (best-effort)
           if ! command -v gh >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y gh
           fi
-          gh release edit "${{ needs.prep_release.outputs.tag }}" --discussion-category "${{ steps.opts.outputs.discussion_category }}"
+          gh release edit "${{ needs.prep_release.outputs.tag }}" --discussion-category "${{ needs.prep_release.outputs.discussion_category }}"
 
       - name: Label merged PRs included in release
-        if: ${{ needs.prep_release.outputs.should_release == 'true' && fromJSON('"' + steps.opts.outputs.pr_labels + '"') != '' }}
+        if: ${{ needs.prep_release.outputs.should_release == 'true' && needs.prep_release.outputs.pr_labels != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG:      ${{ needs.prep_release.outputs.tag }}
           LAST_TAG: ${{ needs.prep_release.outputs.last_tag }}
+          LABELS:   ${{ needs.prep_release.outputs.pr_labels }}
         shell: bash
         run: |
           set -Eeuo pipefail
           if ! command -v gh >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y gh
           fi
-          LABELS="${{ steps.opts.outputs.pr_labels }}"
           IFS=';' read -r -a lab <<< "$LABELS"
           RANGE=""
           if [ -n "$LAST_TAG" ]; then RANGE="$LAST_TAG..$TAG"; else RANGE="$TAG"; fi
