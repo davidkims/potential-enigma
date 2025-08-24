@@ -93,7 +93,7 @@ jobs:
           rm -rf ~/.cache || true
           echo "[RECLAIM] Done"; df -h | sed 's/^/[DF1] /'
 
-      - name: Optional: mount extra disk (self-hosted only)
+      - name: Optional:mount extra disk (self-hosted only)
         if: ${{ env.EXTRA_DISK_DEVICE != '' }}
         run: |
           set -Eeuo pipefail
