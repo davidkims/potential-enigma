@@ -1,4 +1,4 @@
-name: "🧱 Enigma Bulk Folder & Disk Expander (Worktree-Safe + Cron + Daemon + AutoMount)"
+name: "🧱 Enigma Bulk Folder & Disk Expander (Cron+Daemon+AutoMount+SafeInputs)"
 
 on:
   workflow_dispatch:
@@ -32,9 +32,13 @@ on:
         required: true
         default: "true"
       extra_disk_device:
-        description: "셀프호스트 러너 전용: 추가 디스크 장치 경로 (예: /dev/sdb) — 비어있으면 loopback 가상디스크 생성"
+        description: "셀프호스트 러너 전용: 추가 디스크 장치 경로 (예: /dev/sdb) — 비어있으면 loopback 가상디스크 사용"
         required: false
         default: ""
+      loopback_size_gb:
+        description: "loopback 가상 디스크 크기(GB) (빈 값이면 8)"
+        required: false
+        default: "8"
       commit_message:
         description: "커밋 메시지"
         required: true
@@ -61,23 +65,59 @@ jobs:
   expand:
     name: "Bulk Dir + Disk Prep"
     runs-on: ubuntu-latest
-    env:
-      BASE_PATH: ${{ github.event.inputs.base_path }}
-      TOTAL_DIRS: ${{ github.event.inputs.total_dirs }}
-      DEPTH: ${{ github.event.inputs.depth }}
-      FANOUT: ${{ github.event.inputs.fanout }}
-      FILES_PER_DIR: ${{ github.event.inputs.files_per_dir }}
-      DO_DISK_RECLAIM: ${{ github.event.inputs.do_disk_reclaim }}
-      USE_WORKTREE: ${{ github.event.inputs.use_worktree_on_mnt }}
-      EXTRA_DISK_DEVICE: ${{ github.event.inputs.extra_disk_device }}
-      COMMIT_MSG: ${{ github.event.inputs.commit_message }}
-      DAEMON_PROFILE: ${{ github.event.inputs.daemon_profile }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Resolve inputs & set safe defaults (for schedule runs)
+        id: resolve
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # GitHub Expressions는 schedule에서 빈 문자열이 될 수 있으니 쉘에서 최종 보강
+          # 1st-pass: 표현식 기반(비어있으면 ""), 2nd-pass: 쉘 기본값 강제
+          echo "BASE_PATH=${{ github.event.inputs.base_path }}"        >> "$GITHUB_ENV"
+          echo "TOTAL_DIRS=${{ github.event.inputs.total_dirs }}"      >> "$GITHUB_ENV"
+          echo "DEPTH=${{ github.event.inputs.depth }}"                >> "$GITHUB_ENV"
+          echo "FANOUT=${{ github.event.inputs.fanout }}"              >> "$GITHUB_ENV"
+          echo "FILES_PER_DIR=${{ github.event.inputs.files_per_dir }}" >> "$GITHUB_ENV"
+          echo "DO_DISK_RECLAIM=${{ github.event.inputs.do_disk_reclaim }}" >> "$GITHUB_ENV"
+          echo "USE_WORKTREE=${{ github.event.inputs.use_worktree_on_mnt }}" >> "$GITHUB_ENV"
+          echo "EXTRA_DISK_DEVICE=${{ github.event.inputs.extra_disk_device }}" >> "$GITHUB_ENV"
+          echo "LOOPBACK_SIZE_GB=${{ github.event.inputs.loopback_size_gb }}" >> "$GITHUB_ENV"
+          echo "COMMIT_MSG=${{ github.event.inputs.commit_message }}"  >> "$GITHUB_ENV"
+          echo "DAEMON_PROFILE=${{ github.event.inputs.daemon_profile }}" >> "$GITHUB_ENV"
+
+          # 2nd-pass: 빈 값이면 기본값 재설정
+          : "${BASE_PATH:=".github/echo_enigma"}"
+          : "${TOTAL_DIRS:="500"}"
+          : "${DEPTH:="3"}"
+          : "${FANOUT:="5"}"
+          : "${FILES_PER_DIR:="1"}"
+          : "${DO_DISK_RECLAIM:="true"}"
+          : "${USE_WORKTREE:="true"}"
+          : "${EXTRA_DISK_DEVICE:=""}"
+          : "${LOOPBACK_SIZE_GB:="8"}"
+          : "${COMMIT_MSG:="chore(enigma): bulk dir expansion + disk prep"}"
+          : "${DAEMON_PROFILE:="off"}"
+
+          {
+            echo "BASE_PATH=$BASE_PATH"
+            echo "TOTAL_DIRS=$TOTAL_DIRS"
+            echo "DEPTH=$DEPTH"
+            echo "FANOUT=$FANOUT"
+            echo "FILES_PER_DIR=$FILES_PER_DIR"
+            echo "DO_DISK_RECLAIM=$DO_DISK_RECLAIM"
+            echo "USE_WORKTREE=$USE_WORKTREE"
+            echo "EXTRA_DISK_DEVICE=$EXTRA_DISK_DEVICE"
+            echo "LOOPBACK_SIZE_GB=$LOOPBACK_SIZE_GB"
+            echo "COMMIT_MSG=$COMMIT_MSG"
+            echo "DAEMON_PROFILE=$DAEMON_PROFILE"
+          } >> "$GITHUB_ENV"
 
       - name: Git safe.directory (컨테이너/루트 권한 대비)
         run: |
@@ -89,7 +129,7 @@ jobs:
           echo "[MEM]"; free -h || true
 
       - name: Reclaim disk space (GitHub-hosted)
-        if: ${{ env.DO_DISK_RECLAIM == 'true' }}
+        if: env.DO_DISK_RECLAIM == 'true'
         run: |
           set -Eeuo pipefail
           echo "[RECLAIM] Start"
@@ -109,12 +149,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tree parted util-linux e2fsprogs
 
-      - name: Disk mount (Self-hosted device or Loopback fallback — 반드시 마운트)
+      - name: Disk mount (device or loopback — ALWAYS mount)
         run: |
           set -Eeuo pipefail
           TARGET="/mnt/enigma-extra"
           DEV="${EXTRA_DISK_DEVICE:-}"
-          LOOP_SIZE_GB="${LOOP_SIZE_GB:-8}"   # 입력 없이도 기본 8G loopback 생성
+          SIZE="${LOOPBACK_SIZE_GB:-8}"
 
           if [ -n "$DEV" ] && [ -b "$DEV" ]; then
             echo "[MOUNT] Using physical device: $DEV"
@@ -126,9 +166,9 @@ jobs:
             sudo mount "$PART" "$TARGET"
             sudo chown -R "$USER:$USER" "$TARGET"
           else
-            echo "[MOUNT] No physical device. Creating loopback disk ${LOOP_SIZE_GB}G"
+            echo "[MOUNT] No block device; creating loopback disk ${SIZE}G"
             IMG="/mnt/enigma-extra.img"
-            sudo fallocate -l "${LOOP_SIZE_GB}G" "$IMG" || sudo dd if=/dev/zero of="$IMG" bs=1M count=$((LOOP_SIZE_GB*1024))
+            sudo fallocate -l "${SIZE}G" "$IMG" || sudo dd if=/dev/zero of="$IMG" bs=1M count=$((SIZE*1024))
             LOOP="$(sudo losetup -f --show "$IMG")"
             echo "[MOUNT] Loop device: $LOOP"
             sudo mkfs.ext4 -F "$LOOP"
@@ -232,7 +272,7 @@ jobs:
           } > scripts/enigma_expand.sh
           chmod +x scripts/enigma_expand.sh
 
-      - name: One-shot run (한 번 실행)
+      - name: One-shot run
         run: |
           set -Eeuo pipefail
           WDIR="${{ steps.workdir.outputs.workdir }}"
@@ -249,16 +289,17 @@ jobs:
           WDIR="${{ steps.workdir.outputs.workdir }}"
           WTBR="${{ steps.workdir.outputs.worktree_branch }}"
           cd "$WDIR"
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
+
+          CM="${COMMIT_MSG:-chore(enigma): bulk dir expansion + disk prep}"
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit -m "$CM" -a || true
+
+          if git diff --quiet HEAD; then
             echo "committed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          else
+            git push origin "HEAD:$WTBR"
+            echo "committed=true" >> "$GITHUB_OUTPUT"
           fi
-          git commit -m "$COMMIT_MSG"
-          git push origin "HEAD:$WTBR"
-          echo "committed=true" >> "$GITHUB_OUTPUT"
 
       - name: Merge to base branch (FF → rebase → PR)
         if: steps.commit_once.outputs.committed == 'true'
@@ -292,8 +333,8 @@ jobs:
             fi
           fi
 
-      - name: Resident-batch (daemon mode; 6h 러너 한도 내 반복)
-        if: ${{ env.DAEMON_PROFILE != 'off' }}
+      - name: Resident-batch (daemon mode; within runner limit)
+        if: env.DAEMON_PROFILE != 'off'
         run: |
           set -Eeuo pipefail
           WDIR="${{ steps.workdir.outputs.workdir }}"
@@ -301,12 +342,11 @@ jobs:
           BASE="${{ steps.workdir.outputs.base_branch }}"
           cd "$WDIR"
 
-          # 프로파일 → (interval, duration)
           case "${DAEMON_PROFILE:-normal}" in
-            fast)   INTERVAL=60;   DURATION_MIN=60 ;;   # 1분 간격 / 1시간
-            normal) INTERVAL=300;  DURATION_MIN=180 ;;  # 5분 간격 / 3시간
-            slow)   INTERVAL=900;  DURATION_MIN=360 ;;  # 15분 간격 / 6시간
-            *)      INTERVAL=300;  DURATION_MIN=180 ;;  # fallback
+            fast)   INTERVAL=60;   DURATION_MIN=60 ;;   # 1분 / 1시간
+            normal) INTERVAL=300;  DURATION_MIN=180 ;;  # 5분 / 3시간
+            slow)   INTERVAL=900;  DURATION_MIN=360 ;;  # 15분 / 6시간
+            *)      INTERVAL=300;  DURATION_MIN=180 ;;
           esac
 
           echo "[DAEMON] profile=$DAEMON_PROFILE interval=$INTERVAL sec duration=$DURATION_MIN min"
@@ -315,19 +355,20 @@ jobs:
 
           while [ "$(date +%s)" -lt "$END_AT" ]; do
             iter=$((iter+1))
-            echo "[DAEMON][$iter] run expand + push"
+            echo "[DAEMON][$iter] expand + push"
             BASE_PATH="${BASE_PATH:-.github/echo_enigma}" TOTAL_DIRS="${TOTAL_DIRS:-500}" DEPTH="${DEPTH:-3}" \
             FANOUT="${FANOUT:-5}" FILES_PER_DIR="${FILES_PER_DIR:-1}" \
             REPORT_DIR="site/reports" LOG_DIR=".github/echo_enigma/logs" ./scripts/enigma_expand.sh
 
-            git add -A
-            if git diff --cached --quiet; then
+            if git diff --quiet; then
               echo "[DAEMON][$iter] no changes"
             else
+              CM="${COMMIT_MSG:-chore(enigma): bulk dir expansion + disk prep} [daemon#$iter]"
               git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
-                  commit -m "$COMMIT_MSG [daemon#$iter]"
+                  add -A
+              git commit -m "$CM"
               git push origin "HEAD:$WTBR" || true
-              # base fast-forward 시도 (best-effort)
+
               cd "$GITHUB_WORKSPACE"
               git fetch origin "$BASE" "$WTBR" --prune
               git checkout "$BASE"
@@ -347,7 +388,6 @@ jobs:
           WTDIR="/mnt/enigma-work"
           WTBR="${{ steps.workdir.outputs.worktree_branch }}"
           BASE="${{ steps.workdir.outputs.base_branch }}"
-
           if [ -d "$WTDIR" ]; then
             echo "[CLEAN] Removing worktree $WTDIR"
             git worktree remove -f "$WTDIR" || true
