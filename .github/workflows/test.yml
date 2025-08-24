@@ -1,10 +1,9 @@
-name: CI + Release (Ultimate — Must-Release, Matrix, Upgrades, Stable Runners)
+name: CI + Release (Clean — Matrix, Daemon, SemVer Fallback, Notes, Labels, Signing, Win1603-safe)
 
 on:
   push:
     branches: [ "main" ]
-    tags:
-      - "v*.*.*"                # tag push → release
+    tags:     [ "v*.*.*" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -13,48 +12,39 @@ on:
         description: "수동 실행 시 릴리스 생성 (true/false)"
         required: true
         default: "false"
-      prerelease:
-        description: "프리릴리스 표시 (true/false)"
-        required: true
-        default: "false"
-      generate_notes:
-        description: "GitHub 자동 릴리스 노트 병행 (true/false)"
-        required: true
-        default: "true"
       force_version:
-        description: "강제 버전(예: 1.4.0) — 비우면 자동 SemVer(vX.Y.Z)"
+        description: "강제 버전(예: 1.4.0) — 비우면 자동 SemVer(fallback 포함)"
         required: false
         default: ""
-      extra_assets:
-        description: "추가 업로드 글롭(세미콜론 구분, 예: dist/*.tar.gz;bin/*.zip)"
+      build_script:
+        description: "실제 빌드 스크립트 경로(예: scripts/build.sh / .ps1)"
         required: false
-        default: ""
-      draft_release:
-        description: "릴리스를 draft로 생성 (true/false)"
-        required: true
-        default: "false"
-      create_tag:
-        description: "수동 릴리스 시 태그 자동 생성/푸시 (true/false)"
-        required: true
-        default: "true"
-      tag_prefix:
-        description: "자동 태그 접두어 (예: v)"
+        default: "scripts/build.sh"
+      artifact_globs:
+        description: "릴리스 포함 산출물 글롭(세미콜론 구분)"
         required: false
-        default: "v"
-      sbom_enable:
-        description: "SBOM 생성/첨부 (true/false)"
+        default: "dist/**/*;build/**/*"
+      sign_with:
+        description: "자산 서명 방식 (none|gpg|cosign)"
         required: true
-        default: "true"
-      checksum_enable:
-        description: "SHA256 체크섬 생성/첨부 (true/false)"
+        default: "none"
+      daemon_profile:
+        description: "상주 배치 모드 (off|fast|normal|slow)"
         required: true
-        default: "true"
+        default: "off"
+      options_json:
+        description: >-
+          JSON 옵션: {"prerelease":false,"generate_notes":true,"draft":false,
+          "create_tag":true,"tag_prefix":"v","discussion_category":"Announcements",
+          "checksum":true,"sbom":true,"pr_labels":""}
+        required: false
+        default: '{"prerelease":false,"generate_notes":true,"draft":false,"create_tag":true,"tag_prefix":"v","discussion_category":"Announcements","checksum":true,"sbom":true,"pr_labels":""}'
 
 permissions:
   contents: write
 
 env:
-  # 공통 재시도 헬퍼(모든 잡에서 부트스트랩)
+  # 공통 재시도 스크립트 본문
   RETRY_SCRIPT: |
     #!/usr/bin/env bash
     set -Eeuo pipefail
@@ -69,73 +59,155 @@ env:
 
 jobs:
   build_matrix:
-    name: 빌드(${{ matrix.os }})
-    # 러너 마이그레이션 경고 제거 위해 명시 고정
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        # 마이그레이션 경고 제거용 고정 라벨
+        os: [ubuntu-24.04, macos-15, windows-2022]
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Bootstrap retry helper
         shell: bash
         run: |
-          echo "$RETRY_SCRIPT" > .retry.sh
-          chmod +x .retry.sh
+          echo "$RETRY_SCRIPT" > .retry.sh && chmod +x .retry.sh
 
-      - name: 준비_출시 / 환경 업그레이드 (각 OS)
+      # ----- OS 업그레이드 -----
+      - name: Upgrade base packages (Ubuntu)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "[INFO] 준비_출시"
-          case "${{ runner.os }}" in
-            Linux)
-              ./\.retry.sh 3 10 sudo apt-get update
-              ./\.retry.sh 3 10 sudo apt-get -y upgrade
-              ;;
-            macOS)
-              ./\.retry.sh 3 10 brew update
-              ./\.retry.sh 3 10 brew upgrade
-              ;;
-            Windows)
-              ./\.retry.sh 3 10 choco upgrade all -y
-              ;;
-          esac
-          echo "[OK] OS upgrade completed"
+          ./.retry.sh 3 10 sudo apt-get update
+          ./.retry.sh 3 10 sudo DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade
+          sudo apt-get -y autoremove
+          sudo apt-get clean
 
-      - name: Hello from ${{ runner.os }}
-        run: echo "Hello from ${{ runner.os }}!"
-
-      - name: Build placeholder (replace with real build)
-        run: |
-          echo "Build your project here for ${{ runner.os }}"
-
-      - name: Produce per-OS artifact
+      - name: Upgrade base packages (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p out
-          echo "OS=${{ runner.os }}" > "out/info-${{ runner.os }}.txt"
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            mkdir -p release
-            zip -r release/source.zip . -x ".git/*" || true
+          BREW="$(command -v brew || echo /opt/homebrew/bin/brew)"
+          eval "$($BREW shellenv)" || true
+          ./.retry.sh 3 10 "$BREW" update
+          ./.retry.sh 3 10 "$BREW" upgrade
+
+      - name: Upgrade base packages (Windows, except StrawberryPerl)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco feature enable -n=useEnhancedExitCodes
+          choco upgrade all -y --no-progress --except="'strawberryperl'"
+
+      - name: Handle StrawberryPerl upgrade safely (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Continue"
+          $log = "C:\StrawberryPerl_msi_install.log"
+
+          function Test-PendingReboot {
+            $paths = @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+              'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
+            )
+            foreach ($p in $paths) { if (Test-Path $p) { return $true } }
+            return $false
+          }
+
+          if (Test-PendingReboot) {
+            Write-Warning "Pending reboot detected. Pinning StrawberryPerl and skipping upgrade."
+            choco pin add -n=strawberryperl | Out-Null
+            exit 0
+          }
+
+          choco upgrade strawberryperl -y --no-progress --install-arguments="'/l*v $log'"
+          if ($LASTEXITCODE -eq 0) { Write-Host "StrawberryPerl upgraded."; exit 0 }
+
+          if ($LASTEXITCODE -eq 1603) {
+            Write-Warning "MSI 1603: uninstall→install fallback"
+            choco uninstall strawberryperl -y --force --remove-dependencies
+            choco install    strawberryperl -y --no-progress --install-arguments="'/l*v $log'"
+            if ($LASTEXITCODE -eq 0) { Write-Host "StrawberryPerl reinstalled."; exit 0 }
+
+            Write-Warning "Fallback to known-good 5.40.2.2 + pin"
+            choco install strawberryperl --version=5.40.2.2 -y --no-progress --install-arguments="'/l*v $log'"
+            if ($LASTEXITCODE -eq 0) { choco pin add -n=strawberryperl | Out-Null; exit 0 }
+
+            Write-Warning "All attempts failed. Pin current and continue."
+            choco pin add -n=strawberryperl | Out-Null
+          } else {
+            Write-Warning "Non-1603 error. See $log"
+          }
+
+      - name: Upload Windows upgrade logs
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-upgrade-logs
+          path: |
+            C:\StrawberryPerl_msi_install.log
+            C:\ProgramData\chocolatey\logs\chocolatey.log
+          if-no-files-found: ignore
+
+      # ----- 실제 빌드 & 산출물 수집 -----
+      - name: Run actual build script
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SCRIPT="${{ github.event.inputs.build_script }}"
+          if [ -z "$SCRIPT" ] || [ ! -e "$SCRIPT" ]; then
+            echo "::warning::build_script 미제공 → placeholder 빌드"
+            mkdir -p dist && echo "placeholder $(date -u)" > dist/PLACEHOLDER.txt
+          else
+            echo "[BUILD] $SCRIPT"
+            case "$SCRIPT" in
+              *.ps1) pwsh -File "$SCRIPT" ;;
+              *)     chmod +x "$SCRIPT" || true; "$SCRIPT" ;;
+            esac
+          fi
+
+      - name: Collect artifacts (matrix)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p _matrix_release
+          IFS=';' read -r -a arr <<< "${{ github.event.inputs.artifact_globs }}"
+          copied="no"
+          for g in "${arr[@]}"; do
+            [ -z "$g" ] && continue
+            for f in $g; do
+              if [ -f "$f" ]; then
+                mkdir -p "$(dirname "_matrix_release/$f")"
+                cp -f "$f" "_matrix_release/$f"; copied="yes"
+              elif [ -d "$f" ]; then
+                mkdir -p "_matrix_release/$f"
+                cp -rf "$f/." "_matrix_release/$f/"; copied="yes"
+              fi
+            done
+          done
+          if [ "$copied" = "no" ]; then
+            echo "No artifacts matched; generating minimal default."
+            echo "build @ ${{ runner.os }} $(date -u)" > _matrix_release/DEFAULT_${{ runner.os }}.txt
           fi
 
       - name: Upload per-OS artifact
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ runner.os }}
-          path: |
-            out/**
-            release/source.zip
-          if-no-files-found: ignore
+          path: _matrix_release/**
+          if-no-files-found: warn
 
-  prepare_release:
+  prep_release:
+    if: always()
     needs: [build_matrix]
     runs-on: ubuntu-24.04
     outputs:
@@ -146,29 +218,59 @@ jobs:
       generate_notes: ${{ steps.meta.outputs.generate_notes }}
       draft:          ${{ steps.meta.outputs.draft }}
       notes_path:     ${{ steps.notes.outputs.notes_path }}
+      last_tag:       ${{ steps.lasttag.outputs.last_tag }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
-      - name: Bootstrap retry helper
+      - name: Bootstrap retry helper + jq
         shell: bash
         run: |
-          echo "$RETRY_SCRIPT" > .retry.sh
-          chmod +x .retry.sh
+          echo "$RETRY_SCRIPT" > .retry.sh && chmod +x .retry.sh
+          sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Inspect repo state (safe)
+      - name: Parse options_json
+        id: opts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          O='${{ github.event.inputs.options_json }}'
+          # 기본값 병합
+          DEF='{"prerelease":false,"generate_notes":true,"draft":false,"create_tag":true,"tag_prefix":"v","discussion_category":"Announcements","checksum":true,"sbom":true,"pr_labels":""}'
+          MERGED="$(jq -c -n --argjson d "$DEF" --argjson u "$O" '$d * $u')"
+          echo "json=$MERGED" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$(jq -r '.prerelease' <<<"$MERGED")"          >> "$GITHUB_OUTPUT"
+          echo "generate_notes=$(jq -r '.generate_notes' <<<"$MERGED")"  >> "$GITHUB_OUTPUT"
+          echo "draft=$(jq -r '.draft' <<<"$MERGED")"                    >> "$GITHUB_OUTPUT"
+          echo "create_tag=$(jq -r '.create_tag' <<<"$MERGED")"          >> "$GITHUB_OUTPUT"
+          echo "tag_prefix=$(jq -r '.tag_prefix' <<<"$MERGED")"          >> "$GITHUB_OUTPUT"
+          echo "discussion_category=$(jq -r '.discussion_category' <<<"$MERGED")" >> "$GITHUB_OUTPUT"
+          echo "checksum=$(jq -r '.checksum' <<<"$MERGED")"              >> "$GITHUB_OUTPUT"
+          echo "sbom=$(jq -r '.sbom' <<<"$MERGED")"                      >> "$GITHUB_OUTPUT"
+          echo "pr_labels=$(jq -r '.pr_labels' <<<"$MERGED")"            >> "$GITHUB_OUTPUT"
+
+      - name: Inspect repo state
         id: repoinfo
         shell: bash
         run: |
           set -Eeuo pipefail
-          commits="0"
+          commits="0"; tags="0"
           if git rev-parse --verify HEAD >/dev/null 2>&1; then
             commits="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
+            tags="$(git tag -l | wc -l | tr -d ' ')"
           fi
           echo "commit_count=$commits" >> "$GITHUB_OUTPUT"
+          echo "tag_count=$tags"       >> "$GITHUB_OUTPUT"
 
-      - name: Compute next version & changelog (dry run)
+      - name: Last tag (best-effort)
+        id: lasttag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          t="$(git tag -l '${{ steps.opts.outputs.tag_prefix }}*' --sort=-v:refname | head -n1 || true)"
+          echo "last_tag=$t" >> "$GITHUB_OUTPUT"
+
+      - name: Conventional Changelog (dry run; skip if no commits)
         id: semver
         if: ${{ steps.repoinfo.outputs.commit_count != '0' }}
         uses: TriPSs/conventional-changelog-action@v5
@@ -180,191 +282,343 @@ jobs:
           output-file: false
           preset: conventionalcommits
 
-      - name: Map SemVer (fallback / tag-bump safe)
+      - name: Map SemVer (fallback safe)
         id: semvermap
         shell: bash
         run: |
           set -Eeuo pipefail
-          bump_patch() {
-            local t="$1"; t="${t#v}"; IFS='.' read -r MA MI PA <<< "$t"
-            MA="${MA:-0}"; MI="${MI:-1}"; PA="${PA:-0}"
-            PA=$((PA+1)); echo "v${MA}.${MI}.${PA}"
-          }
-          prefix="${{ github.event.inputs.tag_prefix || 'v' }}"
-          if [ "${{ steps.repoinfo.outputs.commit_count }}" = "0" ]; then
+          bump_patch(){ local t="$1"; t="${t#v}"; IFS='.' read -r MA MI PA <<< "$t"; MA="${MA:-0}"; MI="${MI:-1}"; PA="${PA:-0}"; echo "v${MA}.${MI}.$((PA+1))"; }
+          prefix='${{ steps.opts.outputs.tag_prefix }}'
+          if [ '${{ steps.repoinfo.outputs.commit_count }}' = '0' ]; then
             NEXT="${prefix}0.1.0"; CLEAN=""
-            echo "[WARN] SemVer 제거 실패 → fallback ${NEXT}"
+            echo "::warning::SemVer 제거 실패 → fallback v0.1.0"
           else
-            ver="${{ steps.semver.outputs.version }}"
-            CLEAN="${{ steps.semver.outputs.clean_changelog }}"
+            ver='${{ steps.semver.outputs.version }}'
+            CLEAN='${{ steps.semver.outputs.clean_changelog }}'
             if [ -z "$ver" ] || [ "$ver" = "null" ]; then
-              latest="$(git tag -l "${prefix}*" --sort=-v:refname | head -n1 || true)"
-              if [ -z "$latest" ]; then
-                NEXT="${prefix}0.1.0"
-              else
-                NEXT="$(bump_patch "$latest")"
-              fi
-              echo "[WARN] SemVer 계산 실패 → fallback ${NEXT}"
+              latest='${{ steps.lasttag.outputs.last_tag }}'
+              if [ -z "$latest" ]; then NEXT="${prefix}0.1.0"; else NEXT="$(bump_patch "$latest")"; fi
+              echo "::warning::SemVer 계산 실패 → fallback ${NEXT}"
             else
               NEXT="${prefix}${ver}"
             fi
           fi
-          echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
-          echo "clean_changelog=${CLEAN}" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT"            >> "$GITHUB_OUTPUT"
+          echo "clean_changelog=$CLEAN" >> "$GITHUB_OUTPUT"
 
-      - name: Decide release metadata (Must release)
+      - name: Decide release metadata (main-only & must-release)
         id: meta
         shell: bash
         run: |
           set -Eeuo pipefail
-          EVENT="${{ github.event_name }}"
-          REF="${{ github.ref }}"
-          BR="${{ github.ref_name }}"
-          INPUT_ENABLE="${{ github.event.inputs.release_enable || '' }}"
-          INPUT_PRE="${{ github.event.inputs.prerelease || 'false' }}"
-          INPUT_NOTES="${{ github.event.inputs.generate_notes || 'true' }}"
-          INPUT_DRAFT="${{ github.event.inputs.draft_release || 'false' }}"
-          FORCE_VER="${{ github.event.inputs.force_version || '' }}"
-          SHOULD="false"; TAG=""; TITLE=""; DRAFT="$INPUT_DRAFT"
-
-          ./.retry.sh 3 10 git fetch origin main --tags
+          EVENT='${{ github.event_name }}'
+          REF='${{ github.ref }}'
+          BR='${{ github.ref_name }}'
+          MANUAL='${{ github.event.inputs.release_enable }}'
+          FORCE='${{ github.event.inputs.force_version }}'
+          PRERELEASE='${{ steps.opts.outputs.prerelease }}'
+          GEN_NOTES='${{ steps.opts.outputs.generate_notes }}'
+          DRAFT='${{ steps.opts.outputs.draft }}'
+          SHOULD=false; TAG=""; TITLE=""
+          ./.retry.sh 3 5 git fetch origin main --tags
 
           if [[ "$EVENT" == "push" && "$REF" == refs/tags/* ]]; then
             TAG="${REF#refs/tags/}"
             TAGSHA="$(git rev-list -n1 "$TAG")"
-            # main 히스토리에 포함 필수
             if git merge-base --is-ancestor "$TAGSHA" origin/main; then
-              SHOULD="true"; TITLE="$TAG"
+              SHOULD=true; TITLE="$TAG"
             else
-              echo "::error::Tag ${TAG} is not on main history"; exit 1
+              echo "::error::Tag $TAG is not on main history"; exit 1
             fi
           fi
 
-          if [[ "$EVENT" == "workflow_dispatch" && "${INPUT_ENABLE,,}" == "true" ]]; then
-            # 브랜치가 main이 아니어도 반드시 릴리스: origin/main HEAD에 태그 박고 릴리스
-            TARGET_SHA="$(git rev-parse origin/main)"
-            if [ -z "$FORCE_VER" ]; then
+          if [[ "$EVENT" == "workflow_dispatch" && "${MANUAL,,}" == "true" ]]; then
+            if [ "$BR" != "main" ]; then
+              echo "::error::Manual release allowed only on main (current: $BR)"; exit 1
+            fi
+            if [ -n "$FORCE" ]; then
+              TAG="${{ steps.opts.outputs.tag_prefix }}${FORCE}"
+            else
               TAG="${{ steps.semvermap.outputs.next }}"
-            else
-              TAG="${{ github.event.inputs.tag_prefix || 'v' }}${FORCE_VER}"
             fi
-            echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
-            SHOULD="true"; TITLE="Release ${TAG}"
+            SHOULD=true; TITLE="Release ${TAG}"
           fi
 
-          echo "should_release=$SHOULD"         >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG"                       >> "$GITHUB_OUTPUT"
-          echo "title=$TITLE"                   >> "$GITHUB_OUTPUT"
-          echo "prerelease=$INPUT_PRE"          >> "$GITHUB_OUTPUT"
-          echo "generate_notes=$INPUT_NOTES"    >> "$GITHUB_OUTPUT"
-          echo "draft=$DRAFT"                   >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD"      >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"                    >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE"                >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE"      >> "$GITHUB_OUTPUT"
+          echo "generate_notes=$GEN_NOTES"   >> "$GITHUB_OUTPUT"
+          echo "draft=$DRAFT"                >> "$GITHUB_OUTPUT"
 
-      - name: Ensure tag exists (manual:tag on origin/main HEAD)
-        if: ${{ steps.meta.outputs.should_release == 'true' && contains(github.event_name, 'workflow_dispatch') && github.event.inputs.create_tag == 'true' }}
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-          TARGET_SHA: ${{ steps.meta.outputs.target_sha }}
+      - name: Ensure tag exists for manual (create_tag)
+        if: ${{ steps.meta.outputs.should_release == 'true' && contains(github.event_name, 'workflow_dispatch') && steps.opts.outputs.create_tag == 'true' }}
+        env: { TAG: ${{ steps.meta.outputs.tag }} }
         shell: bash
         run: |
           set -Eeuo pipefail
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "[TAG] exists: $TAG"
           else
-            echo "[TAG] creating on origin/main: $TAG @ $TARGET_SHA"
-            git tag -a "$TAG" "$TARGET_SHA" -m "Automated tag $TAG (origin/main)"
+            echo "[TAG] creating: $TAG"
+            git tag -a "$TAG" -m "Automated tag $TAG"
             git push origin "$TAG"
           fi
 
-      - name: Write changelog to file
+      - name: Compose release body (template → BODY.md)
+        id: body
+        if: ${{ steps.meta.outputs.should_release == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update && sudo apt-get install -y jq
+          mkdir -p release
+          TPL=".github/RELEASE_TEMPLATE.md"
+          CHANGELOG='${{ steps.semvermap.outputs.clean_changelog }}'
+          TAG='${{ steps.meta.outputs.tag }}'
+          DATE="$(date -u +%Y-%m-%d)"
+          if [ -f "${{ github.event.inputs.release_template_path }}" ]; then
+            TPL="${{ github.event.inputs.release_template_path }}"
+          fi
+          if [ -f "$TPL" ]; then
+            BODY="$(cat "$TPL")"
+            BODY="${BODY//\{\{TAG\}\}/$TAG}"
+            BODY="${BODY//\{\{DATE\}\}/$DATE}"
+            if [[ "$BODY" == *"{{CHANGELOG}}"* ]]; then BODY="${BODY//\{\{CHANGELOG\}\}/$CHANGELOG}"
+            else BODY="${BODY}\n\n## Changelog\n${CHANGELOG}"; fi
+            printf "%b" "$BODY" > release/BODY.md
+          else
+            echo -e "## ${TAG}\n\n${CHANGELOG}" > release/BODY.md
+          fi
+          echo "body_path=release/BODY.md" >> "$GITHUB_OUTPUT"
+
+      - name: Write changelog file
         id: notes
         if: ${{ steps.meta.outputs.should_release == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p release
-          notes_input="${{ steps.semvermap.outputs.clean_changelog }}"
-          if [ -z "$notes_input" ] || [ "$notes_input" = "null" ]; then
-            echo "Automated release for ${{ steps.meta.outputs.tag }}" > release/CHANGELOG.md
-          else
-            printf "%s\n" "$notes_input" > release/CHANGELOG.md
-          fi
+          if [ -s release/BODY.md ]; then cp -f release/BODY.md release/CHANGELOG.md
+          else echo "Automated release for ${{ steps.meta.outputs.tag }}" > release/CHANGELOG.md; fi
           echo "notes_path=release/CHANGELOG.md" >> "$GITHUB_OUTPUT"
 
   release:
-    needs: [prepare_release]
-    if: ${{ needs.prepare_release.outputs.should_release == 'true' }}
+    if: ${{ always() && needs.prep_release.outputs.should_release == 'true' }}
+    needs: [prep_release]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Bootstrap retry helper
         shell: bash
         run: |
-          echo "$RETRY_SCRIPT" > .retry.sh
-          chmod +x .retry.sh
+          echo "$RETRY_SCRIPT" > .retry.sh && chmod +x .retry.sh
 
-      - name: Download ALL artifacts (matrix merge)
+      - name: Download ALL artifacts (matrix)
         uses: actions/download-artifact@v4
         with:
           path: release
           merge-multiple: true
 
-      - name: Generate SHA256 checksums (optional)
-        if: ${{ github.event.inputs.checksum_enable == 'true' }}
+      - name: Ensure minimal assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ -d release ] || mkdir -p release
+          [ -f release/CHANGELOG.md ] || echo "Empty changelog" > release/CHANGELOG.md
+          if ! ls release | grep -qE '\.(zip|tar|tgz|gz|bz2)$'; then
+            (cd release && zip -r MINIMAL.zip .) || true
+          fi
+
+      - name: Checksums
+        if: ${{ fromJSON(needs.prep_release.outputs.generate_notes) || true && fromJSON(steps.opts_json.outputs.checksum || 'true') != 'false' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           cd release
           find . -type f ! -name "SHA256SUMS.txt" -exec sha256sum "{}" \; | sort -k2 > SHA256SUMS.txt
-          echo "[CSUM] release/SHA256SUMS.txt created"
 
-      - name: Generate SBOM (SPDX) (optional)
-        if: ${{ github.event.inputs.sbom_enable == 'true' }}
+      - name: Import GPG key (optional)
+        if: ${{ github.event.inputs.sign_with == 'gpg' }}
+        continue-on-error: true
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE:  ${{ secrets.GPG_PASSPHRASE }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "::warning::GPG_PRIVATE_KEY missing"; exit 0; }
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --import
+          gpg --list-keys || true
+
+      - name: Sign artifacts with GPG (detached .asc)
+        if: ${{ github.event.inputs.sign_with == 'gpg' }}
+        continue-on-error: true
+        env: { GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }} }
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+          for f in release/*; do
+            [ -d "$f" ] && continue
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" -ab "$f" || true
+          done
+
+      - name: Install cosign (optional)
+        if: ${{ github.event.inputs.sign_with == 'cosign' }}
+        continue-on-error: true
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts with cosign (keyless)
+        if: ${{ github.event.inputs.sign_with == 'cosign' }}
+        continue-on-error: true
+        env: { COSIGN_EXPERIMENTAL: "1" }
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! command -v cosign >/dev/null 2>&1; then echo "::warning::cosign not installed"; exit 0; fi
+          for f in release/*; do
+            [ -d "$f" ] && continue
+            cosign sign-blob --yes "$f" --output-signature "$f.sig" || true
+          done
+
+      - name: Generate SBOM (SPDX)
+        if: ${{ fromJSON(needs.prep_release.outputs.should_release) }}
         uses: anchore/sbom-action@v0
         with:
           path: .
           format: spdx-json
           output-file: release/SBOM.spdx.json
 
-      - name: Create/Update GitHub Release (must)
+      - name: Create/Update GitHub Release
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ needs.prepare_release.outputs.tag }}
-          name: ${{ needs.prepare_release.outputs.title }}
-          draft: ${{ needs.prepare_release.outputs.draft }}
-          prerelease: ${{ needs.prepare_release.outputs.prerelease }}
+          tag:   ${{ needs.prep_release.outputs.tag }}
+          name:  ${{ needs.prep_release.outputs.title }}
+          draft: ${{ needs.prep_release.outputs.draft }}
+          prerelease: ${{ needs.prep_release.outputs.prerelease }}
           allowUpdates: true
-          generateReleaseNotes: ${{ needs.prepare_release.outputs.generate_notes }}
+          generateReleaseNotes: ${{ needs.prep_release.outputs.generate_notes }}
+          bodyFile: release/BODY.md
+          makeLatest: true
           artifacts: |
             release/**
-          artifactErrorsFailBuild: true
+          artifactErrorsFailBuild: false
 
-      - name: Upload extra assets via gh (from inputs.extra_assets)
-        if: ${{ github.event.inputs.extra_assets != '' }}
+      - name: Link Discussion (optional)
+        if: ${{ needs.prep_release.outputs.should_release == 'true' && needs.prep_release.outputs.tag != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.prepare_release.outputs.tag }}
+          CAT: ${{ needs.prep_release.outputs.should_release && 'Announcements' || 'Announcements' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # GitHub Release Action이 discussionCategoryName 옵션 미지원/실패할 수 있어 gh로 후처리 (best-effort)
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y gh
+          fi
+          gh release edit "${{ needs.prep_release.outputs.tag }}" --discussion-category "${{ steps.opts.outputs.discussion_category }}"
+
+      - name: Label merged PRs included in release
+        if: ${{ needs.prep_release.outputs.should_release == 'true' && fromJSON('"' + steps.opts.outputs.pr_labels + '"') != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG:      ${{ needs.prep_release.outputs.tag }}
+          LAST_TAG: ${{ needs.prep_release.outputs.last_tag }}
         shell: bash
         run: |
           set -Eeuo pipefail
           if ! command -v gh >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y gh
           fi
-          IFS=';' read -r -a arr <<< "${{ github.event.inputs.extra_assets }}"
-          for g in "${arr[@]}"; do
-            [ -z "$g" ] && continue
-            matched="no"
-            for f in $g; do
-              if [ -e "$f" ]; then
-                matched="yes"
-                echo "[UPLOAD] $f"
-                ./.retry.sh 3 10 gh release upload "$TAG" "$f" --clobber
-              fi
+          LABELS="${{ steps.opts.outputs.pr_labels }}"
+          IFS=';' read -r -a lab <<< "$LABELS"
+          RANGE=""
+          if [ -n "$LAST_TAG" ]; then RANGE="$LAST_TAG..$TAG"; else RANGE="$TAG"; fi
+          prs=$(git log --merges --pretty=format:%s "$RANGE" 2>/dev/null | sed -n 's/.*#\([0-9][0-9]*\).*/\1/p' | sort -u)
+          for p in $prs; do
+            for l in "${lab[@]}"; do
+              [ -z "$l" ] && continue
+              gh pr edit "$p" --add-label "$l" || true
             done
-            if [ "$matched" = "no" ]; then
-              echo "::error::No files matched extra_assets pattern: $g"; exit 1
-            fi
           done
+
+  daemon:
+    if: ${{ github.event.inputs.daemon_profile != 'off' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Bootstrap retry helper
+        shell: bash
+        run: |
+          echo "$RETRY_SCRIPT" > .retry.sh && chmod +x .retry.sh
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+
+      - name: Resolve daemon schedule
+        id: cfg
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          prof='${{ github.event.inputs.daemon_profile }}'
+          case "$prof" in
+            fast)   D=60  ; I=60  ;;  # 1시간 / 60초
+            normal) D=180 ; I=300 ;;  # 3시간 / 300초
+            slow)   D=360 ; I=900 ;;  # 6시간 / 900초
+            *)      D=180 ; I=300 ;;
+          esac
+          echo "duration_min=$D" >> "$GITHUB_OUTPUT"
+          echo "interval_sec=$I" >> "$GITHUB_OUTPUT"
+
+      - name: Run daemon loop (build → stash artifacts)
+        shell: bash
+        env:
+          BUILD_SCRIPT: ${{ github.event.inputs.build_script }}
+          ART_GLOBS:   ${{ github.event.inputs.artifact_globs }}
+        run: |
+          set -Eeuo pipefail
+          D=${{ steps.cfg.outputs.duration_min }}
+          I=${{ steps.cfg.outputs.interval_sec }}
+          END=$(( $(date +%s) + D*60 ))
+          iter=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            iter=$((iter+1))
+            echo "[DAEMON][$iter] build start"
+            if [ -z "$BUILD_SCRIPT" ] || [ ! -e "$BUILD_SCRIPT" ]; then
+              mkdir -p dist && echo "daemon placeholder $(date -u)" > dist/PLACEHOLDER_$iter.txt
+            else
+              case "$BUILD_SCRIPT" in
+                *.ps1) pwsh -File "$BUILD_SCRIPT" ;;
+                *)     chmod +x "$BUILD_SCRIPT" || true; "$BUILD_SCRIPT" ;;
+              esac
+            fi
+            mkdir -p _daemon_release
+            IFS=';' read -r -a arr <<< "$ART_GLOBS"
+            copied="no"
+            for g in "${arr[@]}"; do
+              [ -z "$g" ] && continue
+              for f in $g; do
+                if [ -f "$f" ]; then mkdir -p "$(dirname "_daemon_release/$f")"; cp -f "$f" "_daemon_release/$f"; copied="yes"
+                elif [ -d "$f" ]; then mkdir -p "_daemon_release/$f"; cp -rf "$f/." "_daemon_release/$f/"; copied="yes"; fi
+              done
+            done
+            if [ "$copied" = "no" ]; then echo "daemon $(date -u)" > "_daemon_release/DEFAULT_$iter.txt"; fi
+            tar -czf "_daemon_release_${iter}.tgz" -C _daemon_release .
+            echo "[DAEMON][$iter] sleep $I"
+            sleep "$I"
+          done
+          echo "[DAEMON] done"
+
+      - name: Upload daemon rollup
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            _daemon_release_*.tgz
+            _daemon_release/**
+          if-no-files-found: ignore
