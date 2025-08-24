@@ -1,4 +1,4 @@
-name: "🧱 Enigma Bulk Folder & Disk Expander (Cron+Daemon+AutoMount+SafeInputs)"
+name: "🧱 Enigma Bulk Folder & Disk Expander (Resilient Cron+Daemon+AutoMount)"
 
 on:
   workflow_dispatch:
@@ -36,14 +36,14 @@ on:
         required: true
         default: "off"
       advanced_opts:
-        description: "고급 옵션(KEY=VALUE;KEY=VALUE...) 예: commit_message=chore;loopback_size_gb=16;extra_disk_device=/dev/sdb"
+        description: "고급 옵션 KEY=VALUE;KEY=VALUE (예: commit_message=chore;loopback_size_gb=16;extra_disk_device=/dev/sdb)"
         required: false
         default: ""
 
   schedule:
-    - cron: "*/5 * * * *"    # 5분마다
-    - cron: "*/10 * * * *"   # 10분마다
-    - cron: "*/15 * * * *"   # 15분마다
+    - cron: "*/5 * * * *"    # 5분
+    - cron: "*/10 * * * *"   # 10분
+    - cron: "*/15 * * * *"   # 15분
 
 permissions:
   contents: write
@@ -55,8 +55,9 @@ concurrency:
 
 jobs:
   expand:
-    name: "Bulk Dir + Disk Prep"
+    name: "Bulk Dir + Disk Prep (Resilient)"
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -65,15 +66,31 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Resolve inputs & defaults (cron-safe) + parse advanced_opts
+      - name: Bootstrap helpers (retry & safe printf)  # 실패해도 계속 진행
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          mkdir -p scripts
+          {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf '%s\n' 'retry() {'
+            printf '%s\n' '  local max="$1"; shift; local sleep_s="$1"; shift'
+            printf '%s\n' '  local n=0;'
+            printf '%s\n' '  until "$@"; do'
+            printf '%s\n' '    n=$((n+1)); [ "$n" -ge "$max" ] && { echo "[RETRY] give up: $*"; return 1; }'
+            printf '%s\n' '    echo "[RETRY] $n/$max failed: $* — sleep ${sleep_s}s"; sleep "$sleep_s";'
+            printf '%s\n' '  done'
+            printf '%s\n' '}'
+          } > scripts/helpers.sh
+          chmod +x scripts/helpers.sh
+
+      - name: Resolve inputs & defaults (cron-safe)
         id: resolve
         shell: bash
         run: |
           set -Eeuo pipefail
+          put(){ echo "$1" >> "$GITHUB_ENV"; }
 
-          put() { echo "$1" >> "$GITHUB_ENV"; }
-
-          # 1) 1차 주입 (schedule일 때는 빈 값일 수 있으므로 "")
           put "BASE_PATH=${{ github.event.inputs.base_path }}"
           put "TOTAL_DIRS=${{ github.event.inputs.total_dirs }}"
           put "DEPTH=${{ github.event.inputs.depth }}"
@@ -84,7 +101,6 @@ jobs:
           put "DAEMON_PROFILE=${{ github.event.inputs.daemon_profile }}"
           put "ADV_OPTS_RAW=${{ github.event.inputs.advanced_opts }}"
 
-          # 2) 기본값 강제(비어있으면 대입)
           : "${BASE_PATH:=".github/echo_enigma"}"
           : "${TOTAL_DIRS:="500"}"
           : "${DEPTH:="3"}"
@@ -94,18 +110,15 @@ jobs:
           : "${USE_WORKTREE:="true"}"
           : "${DAEMON_PROFILE:="off"}"
 
-          # 3) advanced_opts 파싱: KEY=VALUE;KEY=VALUE...
           COMMIT_MSG="chore(enigma): bulk dir expansion + disk prep"
           LOOPBACK_SIZE_GB="8"
           EXTRA_DISK_DEVICE=""
 
           parse_kv () {
-            local raw="$1"
-            IFS=';' read -r -a pairs <<< "$raw"
+            local raw="$1"; IFS=';' read -r -a pairs <<< "$raw"
             for p in "${pairs[@]}"; do
               [ -z "$p" ] && continue
-              key="${p%%=*}"
-              val="${p#*=}"
+              key="${p%%=*}"; val="${p#*=}"
               case "$key" in
                 commit_message)     COMMIT_MSG="$val" ;;
                 loopback_size_gb)   LOOPBACK_SIZE_GB="$val" ;;
@@ -115,7 +128,6 @@ jobs:
           }
           parse_kv "${ADV_OPTS_RAW:-}"
 
-          # 4) 최종 환경으로 반영
           {
             echo "BASE_PATH=$BASE_PATH"
             echo "TOTAL_DIRS=$TOTAL_DIRS"
@@ -131,16 +143,18 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Git safe.directory (권한 이슈 대비)
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+        continue-on-error: true
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
 
       - name: Show disk before
+        continue-on-error: true
         run: |
           echo "[DISK][BEFORE]"; df -hT | sed 's/^/[DF] /' || true
           echo "[MEM]"; free -h || true
 
       - name: Reclaim disk space (GitHub-hosted)
         if: env.DO_DISK_RECLAIM == 'true'
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
           echo "[RECLAIM] Start"
@@ -154,45 +168,62 @@ jobs:
           rm -rf ~/.cache || true
           echo "[RECLAIM] Done"; df -h | sed 's/^/[DF1] /'
 
-      - name: Ensure mount tools
+      - name: Ensure tools (tree/parted/losetup)
         run: |
           set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y tree parted util-linux e2fsprogs
+          source scripts/helpers.sh || true
+          retry 3 5 sudo apt-get update
+          retry 3 5 sudo apt-get install -y tree parted util-linux e2fsprogs || true
 
       - name: Disk mount (device or loopback — ALWAYS mount)
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
+          source scripts/helpers.sh || true
           TARGET="/mnt/enigma-extra"
           DEV="${EXTRA_DISK_DEVICE:-}"
           SIZE="${LOOPBACK_SIZE_GB:-8}"
+
+          ensure_loop() {
+            IMG="/mnt/enigma-extra.img"
+            echo "[MOUNT] Loopback ${SIZE}G at $IMG"
+            retry 3 5 sudo fallocate -l "${SIZE}G" "$IMG" || retry 2 5 sudo dd if=/dev/zero of="$IMG" bs=1M count=$((SIZE*1024))
+            LOOP="$(sudo losetup -f --show "$IMG")"
+            echo "[MOUNT] Loop device: $LOOP"
+            retry 3 5 sudo mkfs.ext4 -F "$LOOP"
+            sudo mkdir -p "$TARGET"
+            retry 3 5 sudo mount "$LOOP" "$TARGET"
+            sudo chown -R "$USER:$USER" "$TARGET"
+          }
 
           if [ -n "$DEV" ] && [ -b "$DEV" ]; then
             echo "[MOUNT] Using physical device: $DEV"
             sudo parted -s "$DEV" mklabel gpt || true
             sudo parted -s "$DEV" mkpart primary ext4 0% 100% || true
             PART="$(lsblk -no PATH "$DEV" | tail -n1)1"; [ -b "$PART" ] || PART="${DEV}1"
-            sudo mkfs.ext4 -F "$PART"
-            sudo mkdir -p "$TARGET"
-            sudo mount "$PART" "$TARGET"
-            sudo chown -R "$USER:$USER" "$TARGET"
+            if ! retry 3 5 sudo mkfs.ext4 -F "$PART"; then
+              echo "[MOUNT][WARN] mkfs on $PART failed — fallback to loopback"
+              ensure_loop
+            else
+              sudo mkdir -p "$TARGET"
+              if ! retry 3 5 sudo mount "$PART" "$TARGET"; then
+                echo "[MOUNT][WARN] mount $PART failed — fallback to loopback"
+                ensure_loop
+              else
+                sudo chown -R "$USER:$USER" "$TARGET" || true
+              fi
+            fi
           else
-            echo "[MOUNT] No block device; creating loopback disk ${SIZE}G"
-            IMG="/mnt/enigma-extra.img"
-            sudo fallocate -l "${SIZE}G" "$IMG" || sudo dd if=/dev/zero of="$IMG" bs=1M count=$((SIZE*1024))
-            LOOP="$(sudo losetup -f --show "$IMG")"
-            echo "[MOUNT] Loop device: $LOOP"
-            sudo mkfs.ext4 -F "$LOOP"
-            sudo mkdir -p "$TARGET"
-            sudo mount "$LOOP" "$TARGET"
-            sudo chown -R "$USER:$USER" "$TARGET"
+            echo "[MOUNT] No block device; using loopback"
+            ensure_loop
           fi
 
-          echo "[MOUNT] Mounted at $TARGET"
-          df -hT "$TARGET" | sed 's/^/[MNT] /'
+          echo "[MOUNT] Mounted at $TARGET (best-effort)"
+          df -hT "$TARGET" || true
 
       - name: Prepare worktree on /mnt (충돌 안전)
         id: workdir
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
           BR="${{ github.ref_name }}"
@@ -206,30 +237,36 @@ jobs:
           echo "base_branch=$BR" >> "$GITHUB_OUTPUT"
 
           if [ "$USE" = "true" ]; then
-            echo "[WT] Requested worktree on $WTDIR for branch: $BR"
-            sudo mkdir -p "$WTDIR"
-            sudo chown -R "$USER:$USER" "$WTDIR"
-
+            echo "[WT] Request worktree on $WTDIR (branch: $BR)"
+            sudo mkdir -p "$WTDIR" && sudo chown -R "$USER:$USER" "$WTDIR" || true
             IN_USE="$(git worktree list --porcelain | sed -n 's/^branch //p' | grep -cx "refs/heads/$BR" || true)"
-            git fetch --all --prune
-
+            git fetch --all --prune || true
             if [ "$IN_USE" != "0" ]; then
-              echo "[WT] Branch '$BR' in use; create temp branch: $WTBR"
-              git branch -f "$WTBR" "$BR"
-              git worktree add "$WTDIR" "$WTBR"
-              echo "worktree_branch=$WTBR" >> "$GITHUB_OUTPUT"
+              echo "[WT] '$BR' in use → temp: $WTBR"
+              git branch -f "$WTBR" "$BR" || true
+              if git worktree add "$WTDIR" "$WTBR"; then
+                echo "worktree_branch=$WTBR" >> "$GITHUB_OUTPUT"
+                WORKDIR="$WTDIR"
+              else
+                echo "[WT][WARN] worktree add failed — fallback to GITHUB_WORKSPACE"
+                echo "worktree_branch=$BR" >> "$GITHUB_OUTPUT"
+              fi
             else
-              git worktree add "$WTDIR" "$BR"
-              echo "worktree_branch=$BR" >> "$GITHUB_OUTPUT"
+              if git worktree add "$WTDIR" "$BR"; then
+                echo "worktree_branch=$BR" >> "$GITHUB_OUTPUT"
+                WORKDIR="$WTDIR"
+              else
+                echo "[WT][WARN] worktree add failed — fallback to GITHUB_WORKSPACE"
+                echo "worktree_branch=$BR" >> "$GITHUB_OUTPUT"
+              fi
             fi
-            WORKDIR="$WTDIR"
           else
-            echo "[WT] Disabled; use current workspace"
+            echo "[WT] Disabled; using current workspace"
             echo "worktree_branch=$BR" >> "$GITHUB_OUTPUT"
           fi
 
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
-          echo "[WT] Workdir: $WORKDIR (branch: $(sed -n 's/^worktree_branch=//p' "$GITHUB_OUTPUT"))"
+          echo "[WT] Workdir: $WORKDIR"
 
       - name: Generate enigma_expand.sh (no-heredoc)
         run: |
@@ -283,84 +320,97 @@ jobs:
           } > scripts/enigma_expand.sh
           chmod +x scripts/enigma_expand.sh
 
-      - name: One-shot run
+      - name: One-shot run (non-fatal)
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
           WDIR="${{ steps.workdir.outputs.workdir }}"
+          [ -z "$WDIR" ] && WDIR="$GITHUB_WORKSPACE"
           cd "$WDIR"
           echo "[RUN][ONESHOT] $(pwd)/scripts/enigma_expand.sh"
           BASE_PATH="${BASE_PATH:-.github/echo_enigma}" TOTAL_DIRS="${TOTAL_DIRS:-500}" DEPTH="${DEPTH:-3}" \
           FANOUT="${FANOUT:-5}" FILES_PER_DIR="${FILES_PER_DIR:-1}" \
-          REPORT_DIR="site/reports" LOG_DIR=".github/echo_enigma/logs" ./scripts/enigma_expand.sh
+          REPORT_DIR="site/reports" LOG_DIR=".github/echo_enigma/logs" ./scripts/enigma_expand.sh || echo "[ONESHOT][WARN] expand failed, continue"
 
-      - name: Commit & push (one-shot)
+      - name: Commit & push (one-shot, resilient)
         id: commit_once
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
+          source scripts/helpers.sh || true
           WDIR="${{ steps.workdir.outputs.workdir }}"
+          [ -z "$WDIR" ] && WDIR="$GITHUB_WORKSPACE"
           WTBR="${{ steps.workdir.outputs.worktree_branch }}"
+          [ -z "$WTBR" ] && WTBR="${{ github.ref_name }}"
           cd "$WDIR"
 
           CM="${COMMIT_MSG:-chore(enigma): bulk dir expansion + disk prep}"
-          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
-              commit -m "$CM" -a || true
-
-          if git diff --quiet HEAD; then
+          git add -A || true
+          if git diff --cached --quiet; then
             echo "committed=false" >> "$GITHUB_OUTPUT"
           else
-            git push origin "HEAD:$WTBR"
+            git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" commit -m "$CM" || true
+            retry 3 5 git push origin "HEAD:$WTBR" || true
             echo "committed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Merge to base branch (FF → rebase → PR)
-        if: steps.commit_once.outputs.committed == 'true'
+      - name: Merge to base branch (FF→rebase→PR, best-effort)
+        if: always()
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
+          source scripts/helpers.sh || true
           BASE="${{ steps.workdir.outputs.base_branch }}"
+          [ -z "$BASE" ] && BASE="${{ github.ref_name }}"
           WTBR="${{ steps.workdir.outputs.worktree_branch }}"
-          echo "[MERGE] Base=$BASE, From=$WTBR"
+          [ -z "$WTBR" ] && WTBR="$BASE"
+          echo "[MERGE] Base=$BASE From=$WTBR"
           cd "$GITHUB_WORKSPACE"
-          git fetch origin "$BASE" "$WTBR" --prune
-          git checkout "$BASE"
+          retry 3 5 git fetch origin "$BASE" "$WTBR" --prune || true
+          git checkout "$BASE" || true
           git pull --ff-only origin "$BASE" || true
           if git merge --ff-only "origin/$WTBR"; then
-            git push origin "$BASE"
+            retry 3 5 git push origin "$BASE" || true
           else
-            echo "[MERGE] FF failed, trying rebase ..."
-            git rebase "origin/$WTBR" || REBASE_FAIL=1
-            if [ "${REBASE_FAIL:-0}" = "1" ]; then
+            echo "[MERGE] FF failed, try rebase"
+            if git rebase "origin/$WTBR"; then
+              retry 3 5 git push origin "$BASE" || true
+            else
+              echo "[MERGE] Rebase failed — creating PR branch"
               NEWBR="enigma/${{ github.run_id }}-${{ github.run_attempt }}"
-              git checkout -b "$NEWBR" "origin/$WTBR"
-              git push -u origin "$NEWBR"
+              git checkout -b "$NEWBR" "origin/$WTBR" || true
+              retry 3 5 git push -u origin "$NEWBR" || true
               if command -v gh >/dev/null 2>&1; then
                 gh pr create --base "$BASE" --head "$NEWBR" \
                   --title "Enigma bulk expansion (run ${{ github.run_id }})" \
-                  --body "Auto-generated bulk folder expansion. Please review and merge."
+                  --body "Auto-generated bulk folder expansion. Please review and merge." || true
               else
-                echo "[PR][WARN] gh CLI not found; pushed branch $NEWBR"
+                echo "[PR][WARN] gh CLI not found; branch pushed: $NEWBR"
               fi
-            else
-              git push origin "$BASE"
             fi
           fi
 
       - name: Resident-batch (daemon mode; within runner limit)
         if: env.DAEMON_PROFILE != 'off'
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
+          source scripts/helpers.sh || true
           WDIR="${{ steps.workdir.outputs.workdir }}"
+          [ -z "$WDIR" ] && WDIR="$GITHUB_WORKSPACE"
           WTBR="${{ steps.workdir.outputs.worktree_branch }}"
+          [ -z "$WTBR" ] && WTBR="${{ github.ref_name }}"
           BASE="${{ steps.workdir.outputs.base_branch }}"
+          [ -z "$BASE" ] && BASE="${{ github.ref_name }}"
           cd "$WDIR"
 
           case "${DAEMON_PROFILE:-normal}" in
-            fast)   INTERVAL=60;   DURATION_MIN=60 ;;   # 1분 / 1시간
-            normal) INTERVAL=300;  DURATION_MIN=180 ;;  # 5분 / 3시간
-            slow)   INTERVAL=900;  DURATION_MIN=360 ;;  # 15분 / 6시간
+            fast)   INTERVAL=60;   DURATION_MIN=60 ;;   # 1분/1시간
+            normal) INTERVAL=300;  DURATION_MIN=180 ;;  # 5분/3시간
+            slow)   INTERVAL=900;  DURATION_MIN=360 ;;  # 15분/6시간
             *)      INTERVAL=300;  DURATION_MIN=180 ;;
           esac
-
-          echo "[DAEMON] profile=$DAEMON_PROFILE interval=$INTERVAL sec duration=$DURATION_MIN min"
+          echo "[DAEMON] profile=$DAEMON_PROFILE interval=$INTERVALs duration=${DURATION_MIN}m"
           END_AT=$(( $(date +%s) + DURATION_MIN*60 ))
           iter=0
 
@@ -369,22 +419,21 @@ jobs:
             echo "[DAEMON][$iter] expand + push"
             BASE_PATH="${BASE_PATH:-.github/echo_enigma}" TOTAL_DIRS="${TOTAL_DIRS:-500}" DEPTH="${DEPTH:-3}" \
             FANOUT="${FANOUT:-5}" FILES_PER_DIR="${FILES_PER_DIR:-1}" \
-            REPORT_DIR="site/reports" LOG_DIR=".github/echo_enigma/logs" ./scripts/enigma_expand.sh
+            REPORT_DIR="site/reports" LOG_DIR=".github/echo_enigma/logs" ./scripts/enigma_expand.sh || echo "[DAEMON][$iter][WARN] expand failed"
 
             if git diff --quiet; then
               echo "[DAEMON][$iter] no changes"
             else
               CM="${COMMIT_MSG:-chore(enigma): bulk dir expansion + disk prep} [daemon#$iter]"
-              git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
-                  add -A
-              git commit -m "$CM"
-              git push origin "HEAD:$WTBR" || true
+              git add -A || true
+              git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" commit -m "$CM" || true
+              retry 3 5 git push origin "HEAD:$WTBR" || true
 
               cd "$GITHUB_WORKSPACE"
-              git fetch origin "$BASE" "$WTBR" --prune
-              git checkout "$BASE"
+              retry 3 5 git fetch origin "$BASE" "$WTBR" --prune || true
+              git checkout "$BASE" || true
               git pull --ff-only origin "$BASE" || true
-              git merge --ff-only "origin/$WTBR" && git push origin "$BASE" || true
+              git merge --ff-only "origin/$WTBR" && retry 3 5 git push origin "$BASE" || true
               cd "$WDIR"
             fi
 
@@ -394,31 +443,33 @@ jobs:
 
       - name: Cleanup worktree & temp branch
         if: always()
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
           WTDIR="/mnt/enigma-work"
           WTBR="${{ steps.workdir.outputs.worktree_branch }}"
           BASE="${{ steps.workdir.outputs.base_branch }}"
-
+          [ -z "$BASE" ] && BASE="${{ github.ref_name }}"
           if [ -d "$WTDIR" ]; then
             echo "[CLEAN] Removing worktree $WTDIR"
             git worktree remove -f "$WTDIR" || true
           fi
-          if [ "$WTBR" != "$BASE" ]; then
-            echo "[CLEAN] Deleting temp branch $WTBR (local)"
+          if [ -n "$WTBR" ] && [ "$WTBR" != "$BASE" ]; then
+            echo "[CLEAN] Deleting temp branch $WTBR (local/remote)"
             git branch -D "$WTBR" || true
-            echo "[CLEAN] Deleting temp branch $WTBR (remote)"
             git push origin --delete "$WTBR" || true
           fi
 
       - name: Show disk/mount after
         if: always()
+        continue-on-error: true
         run: |
           echo "[DISK][AFTER]"; df -hT | sed 's/^/[DF] /' || true
           mount | grep enigma || true
 
       - name: Upload reports/artifacts
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: enigma-reports
