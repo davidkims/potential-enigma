@@ -184,7 +184,7 @@ jobs:
               if [ -f "$f" ]; then
                 mkdir -p "$(dirname "_matrix_release/$f")"
                 cp -f "$f" "_matrix_release/$f"; copied="yes"
-              elif [ -d "$f" ] ; then
+              elif [ -d "$f" ]; then
                 mkdir -p "_matrix_release/$f"
                 cp -rf "$f/." "_matrix_release/$f/"; copied="yes"
               fi
@@ -349,7 +349,7 @@ jobs:
           echo "draft=$DRAFT"              >> "$GITHUB_OUTPUT"
 
       - name: Ensure tag exists for manual (create_tag)
-        if: ${{ steps.meta.outputs.should_release == 'true' && contains(github.event_name, 'workflow_dispatch') && steps.opts.outputs.create_tag == 'true' }}
+        if: ${{ steps.meta.outputs.should_release == 'true' && github.event_name == 'workflow_dispatch' && steps.opts.outputs.create_tag == 'true' }}
         env: { TAG: ${{ steps.meta.outputs.tag }} }
         shell: bash
         run: |
@@ -615,4 +615,4 @@ jobs:
           path: |
             _daemon_release_*.tgz
             _daemon_release/**
-          if-no-files-found: ignore
+          if-no-files-found: igno
