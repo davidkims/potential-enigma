@@ -31,27 +31,19 @@ on:
         description: "/mnt에 worktree 생성해 대용량 작업 (true/false)"
         required: true
         default: "true"
-      extra_disk_device:
-        description: "셀프호스트 러너 전용: 추가 디스크 장치 경로 (예: /dev/sdb) — 비어있으면 loopback 가상디스크 사용"
-        required: false
-        default: ""
-      loopback_size_gb:
-        description: "loopback 가상 디스크 크기(GB) (빈 값이면 8)"
-        required: false
-        default: "8"
-      commit_message:
-        description: "커밋 메시지"
-        required: true
-        default: "chore(enigma): bulk dir expansion + disk prep"
       daemon_profile:
         description: "상주배치 모드 (off|fast|normal|slow)"
         required: true
         default: "off"
+      advanced_opts:
+        description: "고급 옵션(KEY=VALUE;KEY=VALUE...) 예: commit_message=chore;loopback_size_gb=16;extra_disk_device=/dev/sdb"
+        required: false
+        default: ""
 
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다
-    - cron: "*/10 * * * *"  # 10분마다
-    - cron: "*/15 * * * *"  # 15분마다
+    - cron: "*/5 * * * *"    # 5분마다
+    - cron: "*/10 * * * *"   # 10분마다
+    - cron: "*/15 * * * *"   # 15분마다
 
 permissions:
   contents: write
@@ -73,26 +65,26 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Resolve inputs & set safe defaults (for schedule runs)
+      - name: Resolve inputs & defaults (cron-safe) + parse advanced_opts
         id: resolve
         shell: bash
         run: |
           set -Eeuo pipefail
-          # GitHub Expressions는 schedule에서 빈 문자열이 될 수 있으니 쉘에서 최종 보강
-          # 1st-pass: 표현식 기반(비어있으면 ""), 2nd-pass: 쉘 기본값 강제
-          echo "BASE_PATH=${{ github.event.inputs.base_path }}"        >> "$GITHUB_ENV"
-          echo "TOTAL_DIRS=${{ github.event.inputs.total_dirs }}"      >> "$GITHUB_ENV"
-          echo "DEPTH=${{ github.event.inputs.depth }}"                >> "$GITHUB_ENV"
-          echo "FANOUT=${{ github.event.inputs.fanout }}"              >> "$GITHUB_ENV"
-          echo "FILES_PER_DIR=${{ github.event.inputs.files_per_dir }}" >> "$GITHUB_ENV"
-          echo "DO_DISK_RECLAIM=${{ github.event.inputs.do_disk_reclaim }}" >> "$GITHUB_ENV"
-          echo "USE_WORKTREE=${{ github.event.inputs.use_worktree_on_mnt }}" >> "$GITHUB_ENV"
-          echo "EXTRA_DISK_DEVICE=${{ github.event.inputs.extra_disk_device }}" >> "$GITHUB_ENV"
-          echo "LOOPBACK_SIZE_GB=${{ github.event.inputs.loopback_size_gb }}" >> "$GITHUB_ENV"
-          echo "COMMIT_MSG=${{ github.event.inputs.commit_message }}"  >> "$GITHUB_ENV"
-          echo "DAEMON_PROFILE=${{ github.event.inputs.daemon_profile }}" >> "$GITHUB_ENV"
 
-          # 2nd-pass: 빈 값이면 기본값 재설정
+          put() { echo "$1" >> "$GITHUB_ENV"; }
+
+          # 1) 1차 주입 (schedule일 때는 빈 값일 수 있으므로 "")
+          put "BASE_PATH=${{ github.event.inputs.base_path }}"
+          put "TOTAL_DIRS=${{ github.event.inputs.total_dirs }}"
+          put "DEPTH=${{ github.event.inputs.depth }}"
+          put "FANOUT=${{ github.event.inputs.fanout }}"
+          put "FILES_PER_DIR=${{ github.event.inputs.files_per_dir }}"
+          put "DO_DISK_RECLAIM=${{ github.event.inputs.do_disk_reclaim }}"
+          put "USE_WORKTREE=${{ github.event.inputs.use_worktree_on_mnt }}"
+          put "DAEMON_PROFILE=${{ github.event.inputs.daemon_profile }}"
+          put "ADV_OPTS_RAW=${{ github.event.inputs.advanced_opts }}"
+
+          # 2) 기본값 강제(비어있으면 대입)
           : "${BASE_PATH:=".github/echo_enigma"}"
           : "${TOTAL_DIRS:="500"}"
           : "${DEPTH:="3"}"
@@ -100,11 +92,30 @@ jobs:
           : "${FILES_PER_DIR:="1"}"
           : "${DO_DISK_RECLAIM:="true"}"
           : "${USE_WORKTREE:="true"}"
-          : "${EXTRA_DISK_DEVICE:=""}"
-          : "${LOOPBACK_SIZE_GB:="8"}"
-          : "${COMMIT_MSG:="chore(enigma): bulk dir expansion + disk prep"}"
           : "${DAEMON_PROFILE:="off"}"
 
+          # 3) advanced_opts 파싱: KEY=VALUE;KEY=VALUE...
+          COMMIT_MSG="chore(enigma): bulk dir expansion + disk prep"
+          LOOPBACK_SIZE_GB="8"
+          EXTRA_DISK_DEVICE=""
+
+          parse_kv () {
+            local raw="$1"
+            IFS=';' read -r -a pairs <<< "$raw"
+            for p in "${pairs[@]}"; do
+              [ -z "$p" ] && continue
+              key="${p%%=*}"
+              val="${p#*=}"
+              case "$key" in
+                commit_message)     COMMIT_MSG="$val" ;;
+                loopback_size_gb)   LOOPBACK_SIZE_GB="$val" ;;
+                extra_disk_device)  EXTRA_DISK_DEVICE="$val" ;;
+              esac
+            done
+          }
+          parse_kv "${ADV_OPTS_RAW:-}"
+
+          # 4) 최종 환경으로 반영
           {
             echo "BASE_PATH=$BASE_PATH"
             echo "TOTAL_DIRS=$TOTAL_DIRS"
@@ -113,13 +124,13 @@ jobs:
             echo "FILES_PER_DIR=$FILES_PER_DIR"
             echo "DO_DISK_RECLAIM=$DO_DISK_RECLAIM"
             echo "USE_WORKTREE=$USE_WORKTREE"
-            echo "EXTRA_DISK_DEVICE=$EXTRA_DISK_DEVICE"
-            echo "LOOPBACK_SIZE_GB=$LOOPBACK_SIZE_GB"
-            echo "COMMIT_MSG=$COMMIT_MSG"
             echo "DAEMON_PROFILE=$DAEMON_PROFILE"
+            echo "COMMIT_MSG=$COMMIT_MSG"
+            echo "LOOPBACK_SIZE_GB=$LOOPBACK_SIZE_GB"
+            echo "EXTRA_DISK_DEVICE=$EXTRA_DISK_DEVICE"
           } >> "$GITHUB_ENV"
 
-      - name: Git safe.directory (컨테이너/루트 권한 대비)
+      - name: Git safe.directory (권한 이슈 대비)
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
 
@@ -388,6 +399,7 @@ jobs:
           WTDIR="/mnt/enigma-work"
           WTBR="${{ steps.workdir.outputs.worktree_branch }}"
           BASE="${{ steps.workdir.outputs.base_branch }}"
+
           if [ -d "$WTDIR" ]; then
             echo "[CLEAN] Removing worktree $WTDIR"
             git worktree remove -f "$WTDIR" || true
