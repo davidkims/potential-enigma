@@ -1,10 +1,10 @@
-name: CI + Release (Ultra — Matrix, SemVer, Changelog, Multi-asset, Checksums, SBOM)
+name: CI + Release (Ultimate — Must-Release, Matrix, Upgrades, Stable Runners)
 
 on:
   push:
     branches: [ "main" ]
     tags:
-      - "v*.*.*"              # 태그 푸시 → 릴리스
+      - "v*.*.*"                # tag push → release
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -54,7 +54,7 @@ permissions:
   contents: write
 
 env:
-  # 공통 재시도 헬퍼 내용
+  # 공통 재시도 헬퍼(모든 잡에서 부트스트랩)
   RETRY_SCRIPT: |
     #!/usr/bin/env bash
     set -Eeuo pipefail
@@ -69,12 +69,13 @@ env:
 
 jobs:
   build_matrix:
-    name: Build (${{ matrix.os }})
+    name: 빌드(${{ matrix.os }})
+    # 러너 마이그레이션 경고 제거 위해 명시 고정
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-15, windows-2025]
 
     steps:
       - uses: actions/checkout@v4
@@ -87,15 +88,33 @@ jobs:
           echo "$RETRY_SCRIPT" > .retry.sh
           chmod +x .retry.sh
 
+      - name: 준비_출시 / 환경 업그레이드 (각 OS)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "[INFO] 준비_출시"
+          case "${{ runner.os }}" in
+            Linux)
+              ./\.retry.sh 3 10 sudo apt-get update
+              ./\.retry.sh 3 10 sudo apt-get -y upgrade
+              ;;
+            macOS)
+              ./\.retry.sh 3 10 brew update
+              ./\.retry.sh 3 10 brew upgrade
+              ;;
+            Windows)
+              ./\.retry.sh 3 10 choco upgrade all -y
+              ;;
+          esac
+          echo "[OK] OS upgrade completed"
+
       - name: Hello from ${{ runner.os }}
         run: echo "Hello from ${{ runner.os }}!"
 
-      # 실제 프로젝트 빌드/테스트 위치 (샘플)
-      - name: Build placeholder
+      - name: Build placeholder (replace with real build)
         run: |
           echo "Build your project here for ${{ runner.os }}"
 
-      # OS 별 기본 산출물 생성 (간단 텍스트/바이너리 더미)
       - name: Produce per-OS artifact
         shell: bash
         run: |
@@ -118,7 +137,7 @@ jobs:
 
   prepare_release:
     needs: [build_matrix]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       should_release: ${{ steps.meta.outputs.should_release }}
       tag:            ${{ steps.meta.outputs.tag }}
@@ -138,7 +157,7 @@ jobs:
           echo "$RETRY_SCRIPT" > .retry.sh
           chmod +x .retry.sh
 
-      - name: Inspect repo state (safe describe)
+      - name: Inspect repo state (safe)
         id: repoinfo
         shell: bash
         run: |
@@ -149,7 +168,6 @@ jobs:
           fi
           echo "commit_count=$commits" >> "$GITHUB_OUTPUT"
 
-      # Conventional Commits → SemVer/Changelog (커밋 없으면 skip)
       - name: Compute next version & changelog (dry run)
         id: semver
         if: ${{ steps.repoinfo.outputs.commit_count != '0' }}
@@ -162,7 +180,7 @@ jobs:
           output-file: false
           preset: conventionalcommits
 
-      - name: Map SemVer (fallback/tag-bump safe)
+      - name: Map SemVer (fallback / tag-bump safe)
         id: semvermap
         shell: bash
         run: |
@@ -172,27 +190,29 @@ jobs:
             MA="${MA:-0}"; MI="${MI:-1}"; PA="${PA:-0}"
             PA=$((PA+1)); echo "v${MA}.${MI}.${PA}"
           }
+          prefix="${{ github.event.inputs.tag_prefix || 'v' }}"
           if [ "${{ steps.repoinfo.outputs.commit_count }}" = "0" ]; then
-            NEXT="${{ github.event.inputs.tag_prefix || 'v' }}0.1.0"; CLEAN=""
+            NEXT="${prefix}0.1.0"; CLEAN=""
+            echo "[WARN] SemVer 제거 실패 → fallback ${NEXT}"
           else
             ver="${{ steps.semver.outputs.version }}"
             CLEAN="${{ steps.semver.outputs.clean_changelog }}"
             if [ -z "$ver" ] || [ "$ver" = "null" ]; then
-              latest="$(git tag -l '${{ github.event.inputs.tag_prefix || 'v' }}*' --sort=-v:refname | head -n1 || true)"
+              latest="$(git tag -l "${prefix}*" --sort=-v:refname | head -n1 || true)"
               if [ -z "$latest" ]; then
-                NEXT="${{ github.event.inputs.tag_prefix || 'v' }}0.1.0"
+                NEXT="${prefix}0.1.0"
               else
                 NEXT="$(bump_patch "$latest")"
               fi
-              echo "::warning::SemVer 계산 실패 → fallback ${NEXT}"
+              echo "[WARN] SemVer 계산 실패 → fallback ${NEXT}"
             else
-              NEXT="${{ github.event.inputs.tag_prefix || 'v' }}${ver}"
+              NEXT="${prefix}${ver}"
             fi
           fi
           echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
           echo "clean_changelog=${CLEAN}" >> "$GITHUB_OUTPUT"
 
-      - name: Decide release metadata (main-only)
+      - name: Decide release metadata (Must release)
         id: meta
         shell: bash
         run: |
@@ -207,11 +227,12 @@ jobs:
           FORCE_VER="${{ github.event.inputs.force_version || '' }}"
           SHOULD="false"; TAG=""; TITLE=""; DRAFT="$INPUT_DRAFT"
 
-          ./.retry.sh 3 5 git fetch origin main --tags
+          ./.retry.sh 3 10 git fetch origin main --tags
 
           if [[ "$EVENT" == "push" && "$REF" == refs/tags/* ]]; then
             TAG="${REF#refs/tags/}"
             TAGSHA="$(git rev-list -n1 "$TAG")"
+            # main 히스토리에 포함 필수
             if git merge-base --is-ancestor "$TAGSHA" origin/main; then
               SHOULD="true"; TITLE="$TAG"
             else
@@ -220,14 +241,14 @@ jobs:
           fi
 
           if [[ "$EVENT" == "workflow_dispatch" && "${INPUT_ENABLE,,}" == "true" ]]; then
-            if [ "$BR" != "main" ]; then
-              echo "::error::Manual release is allowed only on main (current: $BR)"; exit 1
-            fi
-            if [ -n "$FORCE_VER" ]; then
-              TAG="${{ github.event.inputs.tag_prefix || 'v' }}${FORCE_VER}"
-            else
+            # 브랜치가 main이 아니어도 반드시 릴리스: origin/main HEAD에 태그 박고 릴리스
+            TARGET_SHA="$(git rev-parse origin/main)"
+            if [ -z "$FORCE_VER" ]; then
               TAG="${{ steps.semvermap.outputs.next }}"
+            else
+              TAG="${{ github.event.inputs.tag_prefix || 'v' }}${FORCE_VER}"
             fi
+            echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
             SHOULD="true"; TITLE="Release ${TAG}"
           fi
 
@@ -238,18 +259,19 @@ jobs:
           echo "generate_notes=$INPUT_NOTES"    >> "$GITHUB_OUTPUT"
           echo "draft=$DRAFT"                   >> "$GITHUB_OUTPUT"
 
-      - name: Ensure tag exists for manual release (optional create_tag)
+      - name: Ensure tag exists (manual:tag on origin/main HEAD)
         if: ${{ steps.meta.outputs.should_release == 'true' && contains(github.event_name, 'workflow_dispatch') && github.event.inputs.create_tag == 'true' }}
         env:
           TAG: ${{ steps.meta.outputs.tag }}
+          TARGET_SHA: ${{ steps.meta.outputs.target_sha }}
         shell: bash
         run: |
           set -Eeuo pipefail
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "[TAG] exists: $TAG"
           else
-            echo "[TAG] creating: $TAG"
-            git tag -a "$TAG" -m "Automated tag $TAG"
+            echo "[TAG] creating on origin/main: $TAG @ $TARGET_SHA"
+            git tag -a "$TAG" "$TARGET_SHA" -m "Automated tag $TAG (origin/main)"
             git push origin "$TAG"
           fi
 
@@ -271,7 +293,7 @@ jobs:
   release:
     needs: [prepare_release]
     if: ${{ needs.prepare_release.outputs.should_release == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -283,15 +305,13 @@ jobs:
           echo "$RETRY_SCRIPT" > .retry.sh
           chmod +x .retry.sh
 
-      # 모든 매트릭스 산출물 다운로드 → release/ 로 통합
-      - name: Download ALL artifacts
+      - name: Download ALL artifacts (matrix merge)
         uses: actions/download-artifact@v4
         with:
           path: release
           merge-multiple: true
 
-      # 체크섬 생성(옵션)
-      - name: Generate SHA256 checksums
+      - name: Generate SHA256 checksums (optional)
         if: ${{ github.event.inputs.checksum_enable == 'true' }}
         shell: bash
         run: |
@@ -300,8 +320,7 @@ jobs:
           find . -type f ! -name "SHA256SUMS.txt" -exec sha256sum "{}" \; | sort -k2 > SHA256SUMS.txt
           echo "[CSUM] release/SHA256SUMS.txt created"
 
-      # SBOM 생성(옵션) — Anchore sbom-action 사용
-      - name: Generate SBOM (SPDX)
+      - name: Generate SBOM (SPDX) (optional)
         if: ${{ github.event.inputs.sbom_enable == 'true' }}
         uses: anchore/sbom-action@v0
         with:
@@ -309,8 +328,7 @@ jobs:
           format: spdx-json
           output-file: release/SBOM.spdx.json
 
-      # 릴리스 생성/업데이트 + 기본/추가 자산 업로드
-      - name: Create/Update GitHub Release
+      - name: Create/Update GitHub Release (must)
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -324,7 +342,6 @@ jobs:
             release/**
           artifactErrorsFailBuild: true
 
-      # extra_assets 글롭은 작업 공간 상 경로 기준. 존재하면 추가 업로드
       - name: Upload extra assets via gh (from inputs.extra_assets)
         if: ${{ github.event.inputs.extra_assets != '' }}
         env:
@@ -344,7 +361,7 @@ jobs:
               if [ -e "$f" ]; then
                 matched="yes"
                 echo "[UPLOAD] $f"
-                ./.retry.sh 3 5 gh release upload "$TAG" "$f" --clobber
+                ./.retry.sh 3 10 gh release upload "$TAG" "$f" --clobber
               fi
             done
             if [ "$matched" = "no" ]; then
