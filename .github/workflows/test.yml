@@ -1,36 +1,173 @@
 # This is a basic workflow to help you get started with Actions
 
-name: CI
+name: CI + Release
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
+  # Build on push/PR to main
   push:
     branches: [ "main" ]
+    # If you push a tag like v1.2.3 it will trigger a release
+    tags:
+      - "v*.*.*"
   pull_request:
     branches: [ "main" ]
 
-  # Allows you to run this workflow manually from the Actions tab
+  # Manual run with release options
   workflow_dispatch:
+    inputs:
+      release_enable:
+        description: "수동 실행 시 릴리스 생성 여부 (true/false)"
+        required: true
+        default: "false"
+      release_tag:
+        description: "릴리스 태그 (비우면 자동 생성, 예: v1.0.0)"
+        required: false
+        default: ""
+      release_title:
+        description: "릴리스 제목 (비우면 자동 생성)"
+        required: false
+        default: ""
+      release_prerelease:
+        description: "프리릴리스로 표시 (true/false)"
+        required: true
+        default: "false"
+      release_generate_notes:
+        description: "자동 릴리스 노트 생성 (true/false)"
+        required: true
+        default: "true"
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: write
+
 jobs:
   # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
       - name: Run a one-line script
         run: echo Hello, world!
 
-      # Runs a set of commands using the runners shell
       - name: Run a multi-line script
         run: |
           echo Add other actions to build,
           echo test, and deploy your project.
+
+      # (Optional) Make a release bundle from the repo
+      - name: Make release bundle
+        run: |
+          mkdir -p release
+          git rev-parse --short HEAD > release/COMMIT.txt
+          zip -r release/source.zip . -x ".git/*" || true
+
+      - name: Upload build artifact (for debugging / PRs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-bundle
+          path: release/source.zip
+          if-no-files-found: ignore
+
+  prepare_release:
+    # Run after build
+    needs: [build]
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      title: ${{ steps.meta.outputs.title }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      generate_notes: ${{ steps.meta.outputs.generate_notes }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Decide whether we should release, and compute tag/title defaults
+      - name: Compute release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref }}"
+          INPUT_ENABLE="${{ github.event.inputs.release_enable || '' }}"
+          INPUT_TAG="${{ github.event.inputs.release_tag || '' }}"
+          INPUT_TITLE="${{ github.event.inputs.release_title || '' }}"
+          INPUT_PRE="${{ github.event.inputs.release_prerelease || 'false' }}"
+          INPUT_NOTES="${{ github.event.inputs.release_generate_notes || 'true' }}"
+
+          should_release="false"
+          tag=""
+          title=""
+
+          if [[ "$EVENT" == "push" && "$REF" == refs/tags/* ]]; then
+            # Tag push release
+            should_release="true"
+            tag="${REF#refs/tags/}"
+            title="${INPUT_TITLE:-${tag}}"
+          elif [[ "$EVENT" == "workflow_dispatch" && "${INPUT_ENABLE,,}" == "true" ]]; then
+            # Manual release
+            should_release="true"
+            if [[ -n "$INPUT_TAG" ]]; then
+              tag="$INPUT_TAG"
+            else
+              ts="$(date -u +%Y%m%dT%H%M%SZ)"
+              tag="enigma-${ts}"
+            fi
+            if [[ -n "$INPUT_TITLE" ]]; then
+              title="$INPUT_TITLE"
+            else
+              title="Release ${tag}"
+            fi
+          fi
+
+          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "title=${title}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${INPUT_PRE}" >> "$GITHUB_OUTPUT"
+          echo "generate_notes=${INPUT_NOTES}" >> "$GITHUB_OUTPUT"
+
+      # Rebuild the bundle in this job so we can attach it to release
+      - name: Prepare release assets
+        if: ${{ steps.meta.outputs.should_release == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          git rev-parse --short HEAD > release/COMMIT.txt
+          zip -r release/source.zip . -x ".git/*" || true
+
+      - name: Upload release assets as artifact (for record)
+        if: ${{ steps.meta.outputs.should_release == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release/*
+          if-no-files-found: ignore
+
+  release:
+    # Only run when we’ve decided to release
+    needs: [prepare_release]
+    if: ${{ needs.prepare_release.outputs.should_release == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Download the prepared assets
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+
+      # Create GitHub Release and upload assets
+      # ncipollo/release-action creates or updates the release for the given tag
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ needs.prepare_release.outputs.tag }}
+          name: ${{ needs.prepare_release.outputs.title }}
+          prerelease: ${{ needs.prepare_release.outputs.prerelease }}
+          allowUpdates: true
+          generateReleaseNotes: ${{ needs.prepare_release.outputs.generate_notes }}
+          artifacts: "release/*"
