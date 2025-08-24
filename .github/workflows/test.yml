@@ -1,10 +1,10 @@
-name: CI + Release (Strict, SemVer, Changelog, Multi-asset, No set-output, Safe w/ empty repo)
+name: CI + Release (Ultra — Matrix, SemVer, Changelog, Multi-asset, Checksums, SBOM)
 
 on:
   push:
     branches: [ "main" ]
     tags:
-      - "v*.*.*"          # tag push -> release
+      - "v*.*.*"              # 태그 푸시 → 릴리스
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -29,64 +29,95 @@ on:
         description: "추가 업로드 글롭(세미콜론 구분, 예: dist/*.tar.gz;bin/*.zip)"
         required: false
         default: ""
+      draft_release:
+        description: "릴리스를 draft로 생성 (true/false)"
+        required: true
+        default: "false"
+      create_tag:
+        description: "수동 릴리스 시 태그 자동 생성/푸시 (true/false)"
+        required: true
+        default: "true"
+      tag_prefix:
+        description: "자동 태그 접두어 (예: v)"
+        required: false
+        default: "v"
+      sbom_enable:
+        description: "SBOM 생성/첨부 (true/false)"
+        required: true
+        default: "true"
+      checksum_enable:
+        description: "SHA256 체크섬 생성/첨부 (true/false)"
+        required: true
+        default: "true"
 
 permissions:
   contents: write
 
+env:
+  # 공통 재시도 헬퍼 내용
+  RETRY_SCRIPT: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    max="$1"; shift; sleep_s="$1"; shift; n=0
+    until "$@"; do
+      n=$((n+1))
+      if [ "$n" -ge "$max" ]; then
+        echo "[RETRY] give up: $*"; exit 1
+      fi
+      echo "[RETRY] $n/$max failed: $* — sleep ${sleep_s}s"; sleep "$sleep_s"
+    done
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build_matrix:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # tag/히스토리 전체 필요
+          fetch-depth: 0
 
       - name: Bootstrap retry helper
         shell: bash
         run: |
-          set -Eeuo pipefail
-          cat > .retry.sh << 'EOS'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          max="$1"; shift; sleep_s="$1"; shift; n=0
-          until "$@"; do
-            n=$((n+1))
-            if [ "$n" -ge "$max" ]; then
-              echo "[RETRY] give up: $*"; exit 1
-            fi
-            echo "[RETRY] $n/$max failed: $* — sleep ${sleep_s}s"; sleep "$sleep_s"
-          done
-          EOS
+          echo "$RETRY_SCRIPT" > .retry.sh
           chmod +x .retry.sh
 
-      - name: Hello
-        run: echo Hello, world!
+      - name: Hello from ${{ runner.os }}
+        run: echo "Hello from ${{ runner.os }}!"
 
-      - name: Build placeholder (replace with real build)
+      # 실제 프로젝트 빌드/테스트 위치 (샘플)
+      - name: Build placeholder
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          echo "Build your project here for ${{ runner.os }}"
 
-      - name: Make default release bundle
+      # OS 별 기본 산출물 생성 (간단 텍스트/바이너리 더미)
+      - name: Produce per-OS artifact
+        shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p release
-          if git rev-parse --verify HEAD >/dev/null 2>&1; then
-            git rev-parse --short HEAD > release/COMMIT.txt
-          else
-            echo "EMPTY-REPO" > release/COMMIT.txt
+          mkdir -p out
+          echo "OS=${{ runner.os }}" > "out/info-${{ runner.os }}.txt"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            mkdir -p release
+            zip -r release/source.zip . -x ".git/*" || true
           fi
-          zip -r release/source.zip . -x ".git/*"
 
-      - name: Upload CI artifact
+      - name: Upload per-OS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ci-bundle
-          path: release/source.zip
-          if-no-files-found: error
+          name: bundle-${{ runner.os }}
+          path: |
+            out/**
+            release/source.zip
+          if-no-files-found: ignore
 
   prepare_release:
-    needs: [build]
+    needs: [build_matrix]
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.meta.outputs.should_release }}
@@ -94,28 +125,31 @@ jobs:
       title:          ${{ steps.meta.outputs.title }}
       prerelease:     ${{ steps.meta.outputs.prerelease }}
       generate_notes: ${{ steps.meta.outputs.generate_notes }}
+      draft:          ${{ steps.meta.outputs.draft }}
       notes_path:     ${{ steps.notes.outputs.notes_path }}
-      artifacts_list: ${{ steps.assets.outputs.artifacts_list }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ✅ 저장소 상태 점검: 커밋/태그 유무 확인 → 빈 저장소에서도 안전 진행
-      - name: Inspect repo state
+      - name: Bootstrap retry helper
+        shell: bash
+        run: |
+          echo "$RETRY_SCRIPT" > .retry.sh
+          chmod +x .retry.sh
+
+      - name: Inspect repo state (safe describe)
         id: repoinfo
         shell: bash
         run: |
           set -Eeuo pipefail
-          commits="0"; tags="0"
-          if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          commits="0"
+          if git rev-parse --verify HEAD >/dev/null 2>&1; then
             commits="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
-            tags="$(git tag -l | wc -l | tr -d ' ')"
           fi
           echo "commit_count=$commits" >> "$GITHUB_OUTPUT"
-          echo "tag_count=$tags" >> "$GITHUB_OUTPUT"
 
-      # ✅ Conventional Commits → SemVer/Changelog (커밋 없으면 스킵하고 기본값 제공)
+      # Conventional Commits → SemVer/Changelog (커밋 없으면 skip)
       - name: Compute next version & changelog (dry run)
         id: semver
         if: ${{ steps.repoinfo.outputs.commit_count != '0' }}
@@ -128,29 +162,36 @@ jobs:
           output-file: false
           preset: conventionalcommits
 
-      # ✅ SemVer 매핑 + 빈 저장소 대응(기본 v0.1.0)
-      - name: Map semver output (safe)
+      - name: Map SemVer (fallback/tag-bump safe)
         id: semvermap
         shell: bash
         run: |
           set -Eeuo pipefail
+          bump_patch() {
+            local t="$1"; t="${t#v}"; IFS='.' read -r MA MI PA <<< "$t"
+            MA="${MA:-0}"; MI="${MI:-1}"; PA="${PA:-0}"
+            PA=$((PA+1)); echo "v${MA}.${MI}.${PA}"
+          }
           if [ "${{ steps.repoinfo.outputs.commit_count }}" = "0" ]; then
-            echo "next=v0.1.0" >> "$GITHUB_OUTPUT"
-            echo "clean_changelog=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          ver="${{ steps.semver.outputs.version }}"
-          if [ -z "$ver" ] || [ "$ver" = "null" ]; then
-            echo "::warning::SemVer 계산 실패, fallback v0.1.0"
-            echo "next=v0.1.0" >> "$GITHUB_OUTPUT"
+            NEXT="${{ github.event.inputs.tag_prefix || 'v' }}0.1.0"; CLEAN=""
           else
-            echo "next=v${ver}" >> "$GITHUB_OUTPUT"
+            ver="${{ steps.semver.outputs.version }}"
+            CLEAN="${{ steps.semver.outputs.clean_changelog }}"
+            if [ -z "$ver" ] || [ "$ver" = "null" ]; then
+              latest="$(git tag -l '${{ github.event.inputs.tag_prefix || 'v' }}*' --sort=-v:refname | head -n1 || true)"
+              if [ -z "$latest" ]; then
+                NEXT="${{ github.event.inputs.tag_prefix || 'v' }}0.1.0"
+              else
+                NEXT="$(bump_patch "$latest")"
+              fi
+              echo "::warning::SemVer 계산 실패 → fallback ${NEXT}"
+            else
+              NEXT="${{ github.event.inputs.tag_prefix || 'v' }}${ver}"
+            fi
           fi
-          # TriPSs가 제공하는 깨끗한 변경 로그도 보존(없으면 빈 문자열)
-          notes="${{ steps.semver.outputs.clean_changelog }}"
-          echo "clean_changelog=${notes}" >> "$GITHUB_OUTPUT"
+          echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "clean_changelog=${CLEAN}" >> "$GITHUB_OUTPUT"
 
-      # ✅ 릴리스 메타 결정 + main 필터 (tag push/수동 둘 다 안전)
       - name: Decide release metadata (main-only)
         id: meta
         shell: bash
@@ -162,34 +203,28 @@ jobs:
           INPUT_ENABLE="${{ github.event.inputs.release_enable || '' }}"
           INPUT_PRE="${{ github.event.inputs.prerelease || 'false' }}"
           INPUT_NOTES="${{ github.event.inputs.generate_notes || 'true' }}"
+          INPUT_DRAFT="${{ github.event.inputs.draft_release || 'false' }}"
           FORCE_VER="${{ github.event.inputs.force_version || '' }}"
-          SHOULD="false"; TAG=""; TITLE=""
+          SHOULD="false"; TAG=""; TITLE=""; DRAFT="$INPUT_DRAFT"
 
-          # main 브랜치 히스토리 확보
           ./.retry.sh 3 5 git fetch origin main --tags
 
-          # 태그 푸시 릴리스: 태그 커밋이 main에 포함되어야 함
           if [[ "$EVENT" == "push" && "$REF" == refs/tags/* ]]; then
             TAG="${REF#refs/tags/}"
-            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-              TAGSHA="$(git rev-list -n1 "$TAG")"
-              if git merge-base --is-ancestor "$TAGSHA" origin/main; then
-                SHOULD="true"; TITLE="$TAG"
-              else
-                echo "::error::Tag ${TAG} is not on main history"; exit 1
-              fi
+            TAGSHA="$(git rev-list -n1 "$TAG")"
+            if git merge-base --is-ancestor "$TAGSHA" origin/main; then
+              SHOULD="true"; TITLE="$TAG"
             else
-              echo "::error::Tag object not found: $TAG"; exit 1
+              echo "::error::Tag ${TAG} is not on main history"; exit 1
             fi
           fi
 
-          # 수동 릴리스: 오직 main에서만, 버전 규칙(강제 또는 자동)
           if [[ "$EVENT" == "workflow_dispatch" && "${INPUT_ENABLE,,}" == "true" ]]; then
             if [ "$BR" != "main" ]; then
               echo "::error::Manual release is allowed only on main (current: $BR)"; exit 1
             fi
             if [ -n "$FORCE_VER" ]; then
-              TAG="v${FORCE_VER}"
+              TAG="${{ github.event.inputs.tag_prefix || 'v' }}${FORCE_VER}"
             else
               TAG="${{ steps.semvermap.outputs.next }}"
             fi
@@ -201,8 +236,23 @@ jobs:
           echo "title=$TITLE"                   >> "$GITHUB_OUTPUT"
           echo "prerelease=$INPUT_PRE"          >> "$GITHUB_OUTPUT"
           echo "generate_notes=$INPUT_NOTES"    >> "$GITHUB_OUTPUT"
+          echo "draft=$DRAFT"                   >> "$GITHUB_OUTPUT"
 
-      # ✅ 체인지로그 파일(없으면 기본 메시지) — set-output 미사용
+      - name: Ensure tag exists for manual release (optional create_tag)
+        if: ${{ steps.meta.outputs.should_release == 'true' && contains(github.event_name, 'workflow_dispatch') && github.event.inputs.create_tag == 'true' }}
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "[TAG] exists: $TAG"
+          else
+            echo "[TAG] creating: $TAG"
+            git tag -a "$TAG" -m "Automated tag $TAG"
+            git push origin "$TAG"
+          fi
+
       - name: Write changelog to file
         id: notes
         if: ${{ steps.meta.outputs.should_release == 'true' }}
@@ -218,88 +268,86 @@ jobs:
           fi
           echo "notes_path=release/CHANGELOG.md" >> "$GITHUB_OUTPUT"
 
-      # ✅ 자산 수집(기본 + extra_assets); 매칭 실패 시 실패
-      - name: Collect assets list
-        id: assets
-        if: ${{ steps.meta.outputs.should_release == 'true' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          test -f release/source.zip
-          test -f "${{ steps.notes.outputs.notes_path }}"
-          LIST="release/source.zip"$'\n'"${{ steps.notes.outputs.notes_path }}"
-          EXTRA="${{ github.event.inputs.extra_assets || '' }}"
-          IFS=';' read -r -a arr <<< "$EXTRA"
-          for g in "${arr[@]}"; do
-            [ -z "$g" ] && continue
-            matched=""
-            for f in $g; do
-              if [ -e "$f" ]; then
-                LIST+=$'\n'"$f"; matched="yes"
-              fi
-            done
-            if [ -z "$matched" ]; then
-              echo "::error::No files matched extra_assets pattern: $g"; exit 1
-            fi
-          done
-          echo "artifacts_list<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$LIST" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
   release:
     needs: [prepare_release]
     if: ${{ needs.prepare_release.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Download CI artifact
+      - name: Bootstrap retry helper
+        shell: bash
+        run: |
+          echo "$RETRY_SCRIPT" > .retry.sh
+          chmod +x .retry.sh
+
+      # 모든 매트릭스 산출물 다운로드 → release/ 로 통합
+      - name: Download ALL artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ci-bundle
           path: release
+          merge-multiple: true
 
-      - name: Write artifact list to disk
-        id: list
+      # 체크섬 생성(옵션)
+      - name: Generate SHA256 checksums
+        if: ${{ github.event.inputs.checksum_enable == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "${{ needs.prepare_release.outputs.artifacts_list }}" > artifacts.txt
-          echo "Artifacts to upload:" && cat artifacts.txt
+          cd release
+          find . -type f ! -name "SHA256SUMS.txt" -exec sha256sum "{}" \; | sort -k2 > SHA256SUMS.txt
+          echo "[CSUM] release/SHA256SUMS.txt created"
 
-      # 기본 자산 업로드(릴리스 생성/갱신)
+      # SBOM 생성(옵션) — Anchore sbom-action 사용
+      - name: Generate SBOM (SPDX)
+        if: ${{ github.event.inputs.sbom_enable == 'true' }}
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: release/SBOM.spdx.json
+
+      # 릴리스 생성/업데이트 + 기본/추가 자산 업로드
       - name: Create/Update GitHub Release
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ needs.prepare_release.outputs.tag }}
           name: ${{ needs.prepare_release.outputs.title }}
+          draft: ${{ needs.prepare_release.outputs.draft }}
           prerelease: ${{ needs.prepare_release.outputs.prerelease }}
           allowUpdates: true
           generateReleaseNotes: ${{ needs.prepare_release.outputs.generate_notes }}
           artifacts: |
-            release/source.zip
-            release/CHANGELOG.md
+            release/**
           artifactErrorsFailBuild: true
 
-      # 추가 자산 업로드(gh 사용; 실패 시 재시도 후 실패)
-      - name: Upload extra assets (loop via gh)
+      # extra_assets 글롭은 작업 공간 상 경로 기준. 존재하면 추가 업로드
+      - name: Upload extra assets via gh (from inputs.extra_assets)
+        if: ${{ github.event.inputs.extra_assets != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare_release.outputs.tag }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          TAG="${{ needs.prepare_release.outputs.tag }}"
           if ! command -v gh >/dev/null 2>&1; then
-            echo "::group::Install gh"
-            sudo apt-get update
-            sudo apt-get install -y gh
-            echo "::endgroup::"
+            sudo apt-get update && sudo apt-get install -y gh
           fi
-          while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            [ "$line" = "release/source.zip" ] && continue
-            [ "$line" = "release/CHANGELOG.md" ] && continue
-            test -e "$line"
-            ../../.github/workflows/../.retry.sh 3 5 gh release upload "$TAG" "$line" --clobber
-          done < artifacts.txt
+          IFS=';' read -r -a arr <<< "${{ github.event.inputs.extra_assets }}"
+          for g in "${arr[@]}"; do
+            [ -z "$g" ] && continue
+            matched="no"
+            for f in $g; do
+              if [ -e "$f" ]; then
+                matched="yes"
+                echo "[UPLOAD] $f"
+                ./.retry.sh 3 5 gh release upload "$TAG" "$f" --clobber
+              fi
+            done
+            if [ "$matched" = "no" ]; then
+              echo "::error::No files matched extra_assets pattern: $g"; exit 1
+            fi
+          done
